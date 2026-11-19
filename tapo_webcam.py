@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-tapo-webcam – holt regelmäßig Standbilder aus Tapo-Kameras, auch aus Modellen
-ohne RTSP/ONVIF (Akku-Kameras, Türklingeln, Kameras am Hub H200/H500).
+tapo-webcam – periodically grabs still images from Tapo cameras, including models
+without RTSP/ONVIF (battery cameras, doorbells, cameras paired to an H200/H500 hub).
 
-Zwei Verbindungswege pro Kamera:
-  local – lokales TP-Link-Protokoll (Port 8800) wie die App im WLAN, via pytapo
-  cloud – über das TP-Link-Cloud-Relay wie die App unterwegs, via ontapo
-          (inoffiziell/experimentell; kein LAN/VPN nötig)
+Two connection types per camera:
+  local – local TP-Link protocol (port 8800), like the app on the same Wi-Fi, via pytapo
+  cloud – through the TP-Link cloud relay, like the app on the go, via ontapo
+          (unofficial/experimental; no LAN/VPN required)
 
-Befehle:
-  tapo_webcam.py discover -c config.toml   Kamera prüfen, Hub-Kinder auflisten
-  tapo_webcam.py snap     -c config.toml   Ein Bild aufnehmen und speichern
-  tapo_webcam.py serve    -c config.toml   Dienst: Intervall + HTTP-API
-  tapo_webcam.py cloud-login -c config.toml  Tapo-Konto anmelden (für connection="cloud")
+Commands:
+  tapo_webcam.py discover -c config.toml      check cameras, list hub children
+  tapo_webcam.py snap     -c config.toml      take and store one picture
+  tapo_webcam.py serve    -c config.toml      service: interval captures + HTTP API
+  tapo_webcam.py cloud-login -c config.toml   sign in to the Tapo account (for connection="cloud")
   tapo_webcam.py placeholders -c config.toml [--upload]
-                                           Nacht-/Außer-Betrieb-Platzhalter als Vorschau ablegen, optional SFTP-Test
+                                              render night/offline placeholder previews, optional SFTP test
 """
 from __future__ import annotations
 
@@ -32,54 +32,85 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger("tapo-webcam")
-logging.getLogger("paramiko").setLevel(logging.WARNING)   # sonst 3 INFO-Zeilen pro Upload
+logging.getLogger("paramiko").setLevel(logging.WARNING)   # otherwise 3 INFO lines per upload
 
 
 # --------------------------------------------------------------------------- #
-# Konfiguration
+# Language-dependent defaults for placeholder images
+# --------------------------------------------------------------------------- #
+TEXTS = {
+    "en": {
+        "night": "It's night\nNext picture at {next}",
+        "offline": "Temporarily out of service\nAs of {date}, {time}",
+        "tomorrow": "tomorrow",
+        "weekdays": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        "date": "%Y-%m-%d",
+        "as_of": "as of",
+    },
+    "de": {
+        "night": "Es ist Nacht\nNächstes Bild ab {next} Uhr",
+        "offline": "Vorübergehend außer Betrieb\nStand: {date}, {time} Uhr",
+        "tomorrow": "morgen",
+        "weekdays": ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"],
+        "date": "%d.%m.%Y",
+        "as_of": "Stand",
+    },
+}
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
 # --------------------------------------------------------------------------- #
 @dataclass
 class CameraConfig:
     name: str
-    connection: str = "local"        # local = im LAN (pytapo) | cloud = über TP-Link-Cloud-Relay (ontapo)
-    host: str = ""                   # nur local: IP der Kamera bzw. des Hubs
-    password: str = ""               # nur local: Passwort des TP-Link/Tapo-Kontos
-    cloud_device: str | None = None  # nur cloud: Kameraname aus der App oder device_id
-    cloud_seconds: float = 3.0       # nur cloud: so lange wird der Stream geöffnet (kürzer = akkuschonender)
-    cloud_retries: int = 3           # nur cloud: Wiederholungen, wenn die Kamera noch nicht wach ist (Relay 404)
-    cloud_retry_wait: float = 5.0    # nur cloud: Sekunden zwischen den Wiederholungen
+    connection: str = "local"        # local = in the LAN (pytapo) | cloud = via the TP-Link cloud relay (ontapo)
+    host: str = ""                   # local only: IP of the camera or hub
+    password: str = ""               # local only: password of the TP-Link/Tapo account
+    cloud_device: str | None = None  # cloud only: camera name from the app, or device_id
+    cloud_seconds: float = 3.0       # cloud only: how long the stream is opened (shorter = saves battery)
+    cloud_retries: int = 3           # cloud only: retries while the camera is not awake yet (relay 404)
+    cloud_retry_wait: float = 5.0    # cloud only: seconds between retries
     user: str = "admin"
-    child_id: str | None = None      # nur bei Kamera am Hub: device_id des Kindgeräts
+    child_id: str | None = None      # hub cameras only: device_id of the child device
     mode: str = "auto"               # auto | snapshot | stream
-    quality: str = "HD"              # für mode=stream: HD | VGA
-    interval: int = 300              # Sekunden zwischen Aufnahmen, 0 = aus
-    timeout: int = 20                # Sekunden pro Aufnahmeversuch
-    cache_seconds: int = 15          # so lange wird ein frisches Bild wiederverwendet
-    jpeg_quality: int = 3            # ffmpeg -q:v (2 = beste, 31 = schlechteste)
-    # Zeitfenster für die Intervall-Aufnahmen, z. B. "08:00-19:00" (leer = rund um die Uhr)
+    quality: str = "HD"              # for mode=stream: HD | VGA
+    interval: int = 300              # seconds between captures, 0 = off
+    timeout: int = 20                # seconds per capture attempt
+    cache_seconds: int = 15          # a fresh picture is reused for this long
+    jpeg_quality: int = 3            # ffmpeg -q:v (2 = best, 31 = worst)
+    # time window for interval captures, e.g. "08:00-19:00" (empty = around the clock)
     active_hours: str = ""
-    active_days: str = ""            # z. B. "Mo-Fr" oder "Sa,So" (leer = jeden Tag)
-    # Datenschutz: Bild direkt nach dem Download verkleinern/weichzeichnen
-    max_width: int = 0               # z. B. 1280; 0 = Originalgröße
-    blur: float = 0.0                # Gauß-Weichzeichner-Radius in Pixeln (nach dem Verkleinern), 0 = aus
-    output_quality: int = 80         # JPEG-Qualität des gespeicherten Bildes (1–95)
-    face_blur: bool = False          # Gesichter erkennen und unkenntlich machen (OpenCV YuNet)
-    face_threshold: float = 0.6      # Erkennungsschwelle 0–1: niedriger = findet mehr, aber auch Fehltreffer
-    face_margin: float = 0.4         # Rand um das Gesicht, der mit verpixelt wird (Anteil der Gesichtsgröße)
-    # nur cloud: Akkuschutz. Der Akkustand wird nach jedem Bild ausgelesen (Kamera ist dann ohnehin wach).
-    battery_min: int = 0             # liegt der letzte Wert darunter (in %), pausieren die Intervall-Aufnahmen; 0 = aus
-    battery_pause_hours: float = 6.0 # Pausendauer; danach ein Bild + neue Messung, bei weiter zu wenig Akku erneut Pause
-    # Platzhalterbild statt Kamerabild: nachts (außerhalb active_hours/active_days) sowie "außer Betrieb"
-    # (Akkupause oder Kamera/Cloud nicht erreichbar – der Grund wird bewusst nicht angezeigt).
-    # Wird einmal pro Pause/Störung als latest.jpg abgelegt und hochgeladen (nicht ins Archiv).
+    active_days: str = ""            # e.g. "Mon-Fri" or "Sat,Sun" (empty = every day)
+    # privacy: shrink/blur the picture right after download
+    max_width: int = 0               # e.g. 1280; 0 = original size
+    blur: float = 0.0                # Gaussian blur radius in pixels (after resizing), 0 = off
+    output_quality: int = 80         # JPEG quality of the stored picture (1–95)
+    face_blur: bool = False          # detect faces and make them unrecognisable (OpenCV YuNet)
+    face_threshold: float = 0.6      # detection threshold 0–1: lower = finds more, but more false positives
+    face_margin: float = 0.4         # extra margin pixelated around each face (fraction of face size)
+    # cloud only: battery protection. The level is read after every picture (camera is awake anyway).
+    battery_min: int = 0             # below this level (%) interval captures pause; 0 = off
+    battery_pause_hours: float = 6.0 # pause length; then one picture + new reading, pause again if still low
+    # Placeholder picture instead of a camera picture: at night (outside active_hours/active_days) and
+    # "out of service" (battery pause or camera/cloud unreachable – the reason is deliberately not shown).
+    # Stored once per pause/outage as latest.jpg and uploaded (not archived).
     placeholders: bool = False
-    night_image: str = ""            # eigenes Bild (JPEG/PNG) als Hintergrund; leer = dunkler Hintergrund mit Mond
-    night_text: str = "Es ist Nacht\nNächstes Bild ab {next} Uhr"
-    offline_image: str = ""          # eigenes Bild; leer = grauer Hintergrund mit durchgestrichener Kamera
-    offline_text: str = "Vorübergehend außer Betrieb\nStand: {date}, {time} Uhr"
-    offline_after: int = 1           # nach so vielen fehlgeschlagenen Intervall-Aufnahmen in Folge
-    upload: bool = True              # an [upload] senden (falls konfiguriert)
-    upload_name: str = ""            # Dateiname auf dem Server; leer = [upload] name
+    language: str = "en"             # language of the default placeholder texts and dates: en | de
+    night_image: str = ""            # own background picture (JPEG/PNG); empty = dark background with moon
+    night_text: str | None = None    # None = default text for `language`
+    offline_image: str = ""          # own background picture; empty = grey background with crossed-out camera
+    offline_text: str | None = None  # None = default text for `language`
+    offline_after: int = 1           # after this many failed interval captures in a row
+    upload: bool = True              # send to [upload] (if configured)
+    upload_name: str = ""            # file name on the server; empty = [upload] name
+
+    def __post_init__(self):
+        t = TEXTS.get(self.language, TEXTS["en"])
+        if self.night_text is None:
+            self.night_text = t["night"]
+        if self.offline_text is None:
+            self.offline_text = t["offline"]
 
 
 @dataclass
@@ -87,32 +118,34 @@ class UploadConfig:
     host: str
     user: str
     port: int = 22
-    password: str = ""               # besser über Umgebungsvariable (password_env, Standard SFTP_PASSWORD)
-    key: str = ""                    # privater SSH-Schlüssel (OpenSSH-Format), z. B. /var/lib/tapo-webcam/.ssh/sftp_ed25519
-    dir: str = "."                   # Zielverzeichnis auf dem Server
-    name: str = "{camera}.jpg"       # Dateiname auf dem Server ({camera} = Kameraname)
-    known_hosts: str = ""            # leer = known_hosts_sftp neben cloud_session_file
+    password: str = ""               # better via environment variable (password_env, default SFTP_PASSWORD)
+    key: str = ""                    # private SSH key (OpenSSH format), e.g. /var/lib/tapo-webcam/.ssh/sftp_ed25519
+    dir: str = "."                   # target directory on the server
+    name: str = "{camera}.jpg"       # file name on the server ({camera} = camera name)
+    known_hosts: str = ""            # empty = known_hosts_sftp next to cloud_session_file
     timeout: float = 30.0
 
 
 @dataclass
 class Config:
     output_dir: Path = Path("./images")
-    retention_days: int = 14         # 0 = nie löschen
-    keep_history: bool = True        # False = nur latest.jpg pflegen
+    retention_days: int = 14         # 0 = never delete
+    keep_history: bool = True        # False = only maintain latest.jpg
     listen: str = "0.0.0.0"
     port: int = 8099
-    token: str | None = None         # optionaler API-Token (?token=… oder Header X-Token)
-    cloud_session_file: str = "cloud_session.json"   # von `cloud-login` angelegt
+    token: str | None = None         # optional API token (?token=… or header X-Token)
+    cloud_session_file: str = "cloud_session.json"   # created by `cloud-login`
     cameras: list[CameraConfig] = field(default_factory=list)
     upload: UploadConfig | None = None
 
 
-_DAYS = ["mo", "di", "mi", "do", "fr", "sa", "so"]
+# weekday abbreviations, English and German (0 = Monday)
+_DAYS = {"mo": 0, "tu": 1, "we": 2, "th": 3, "fr": 4, "sa": 5, "su": 6,
+         "di": 1, "mi": 2, "do": 3, "so": 6}
 
 
 def parse_hours(spec: str, cam: str = "") -> tuple[int, int] | None:
-    """"08:00-19:00" -> (480, 1140) Minuten seit Mitternacht; über Mitternacht erlaubt ("22:00-06:00")."""
+    """"08:00-19:00" -> (480, 1140) minutes since midnight; may span midnight ("22:00-06:00")."""
     if not spec:
         return None
     try:
@@ -122,11 +155,11 @@ def parse_hours(spec: str, cam: str = "") -> tuple[int, int] | None:
         assert 0 <= start < 1440 and 0 <= end <= 1440 and start != end
         return start, end
     except Exception:  # noqa: BLE001
-        raise SystemExit(f"Kamera '{cam}': active_hours '{spec}' ungültig, Format z. B. \"08:00-19:00\".")
+        raise SystemExit(f"Camera '{cam}': invalid active_hours '{spec}', expected e.g. \"08:00-19:00\".")
 
 
 def parse_days(spec: str, cam: str = "") -> set[int] | None:
-    """"Mo-Fr" / "Sa,So" / "Mo,Mi,Fr" -> {0,…} (0 = Montag)."""
+    """"Mon-Fri" / "Sat,Sun" / "Mo,Mi,Fr" -> {0,…} (0 = Monday). English and German abbreviations."""
     if not spec:
         return None
     out: set[int] = set()
@@ -134,13 +167,13 @@ def parse_days(spec: str, cam: str = "") -> set[int] | None:
         for part in spec.lower().replace(" ", "").split(","):
             if "-" in part:
                 a, b = part.split("-")
-                i, j = _DAYS.index(a[:2]), _DAYS.index(b[:2])
+                i, j = _DAYS[a[:2]], _DAYS[b[:2]]
                 out.update(range(i, j + 1) if i <= j else list(range(i, 7)) + list(range(0, j + 1)))
             else:
-                out.add(_DAYS.index(part[:2]))
+                out.add(_DAYS[part[:2]])
         return out
-    except ValueError:
-        raise SystemExit(f"Kamera '{cam}': active_days '{spec}' ungültig, z. B. \"Mo-Fr\" oder \"Sa,So\".")
+    except (KeyError, ValueError):
+        raise SystemExit(f"Camera '{cam}': invalid active_days '{spec}', expected e.g. \"Mon-Fri\" or \"Sat,Sun\".")
 
 
 def is_active(c: "CameraConfig", now: dt.datetime | None = None) -> bool:
@@ -157,10 +190,10 @@ def is_active(c: "CameraConfig", now: dt.datetime | None = None) -> bool:
 
 
 def next_active(c: "CameraConfig", now: dt.datetime | None = None) -> dt.datetime | None:
-    """Beginn des nächsten Aufnahme-Zeitfensters (minutengenau, nach `now`), None = immer/nie aktiv."""
+    """Start of the next capture window (to the minute, after `now`); None = always/never active."""
     now = (now or dt.datetime.now()).replace(second=0, microsecond=0)
     t = now + dt.timedelta(minutes=1)
-    seen_inactive = not is_active(c, now)       # läuft gerade ein Fenster, erst dessen Ende abwarten
+    seen_inactive = not is_active(c, now)       # inside a window: wait for its end first
     for _ in range(8 * 1440):
         if is_active(c, t):
             if seen_inactive:
@@ -172,21 +205,26 @@ def next_active(c: "CameraConfig", now: dt.datetime | None = None) -> dt.datetim
 
 
 def next_capture_after(c: "CameraConfig", t: dt.datetime) -> dt.datetime:
-    """t, oder – falls t außerhalb des Zeitfensters liegt – dessen nächster Beginn."""
+    """t, or – if t is outside the time window – the start of the next window."""
     return t if is_active(c, t) else (next_active(c, t) or t)
 
 
-def fmt_when(t: dt.datetime | None, now: dt.datetime | None = None) -> str:
-    """'09:00', 'morgen 09:00' oder 'Mo 09:00'."""
+def fmt_when(t: dt.datetime | None, now: dt.datetime | None = None, language: str = "en") -> str:
+    """'09:00', 'tomorrow 09:00' or 'Mon 09:00' (in the given language)."""
     if t is None:
         return "?"
+    tx = TEXTS.get(language, TEXTS["en"])
     now = now or dt.datetime.now()
     days = (t.date() - now.date()).days
     if days == 0:
         return t.strftime("%H:%M")
     if days == 1:
-        return "morgen " + t.strftime("%H:%M")
-    return ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][t.weekday()] + " " + t.strftime("%H:%M")
+        return f"{tx['tomorrow']} {t:%H:%M}"
+    return f"{tx['weekdays'][t.weekday()]} {t:%H:%M}"
+
+
+def fmt_date(t: dt.datetime, language: str = "en") -> str:
+    return t.strftime(TEXTS.get(language, TEXTS["en"])["date"])
 
 
 _FONT_DIRS = ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu", "/usr/share/fonts/TTF")
@@ -207,7 +245,7 @@ def _font(size: int, bold: bool = False):
 
 
 def render_placeholder(c: "CameraConfig", kind: str, values: dict, size: tuple[int, int] | None = None) -> bytes:
-    """Platzhalterbild 'night' oder 'offline' als JPEG."""
+    """Placeholder picture 'night' or 'offline' as JPEG."""
     from io import BytesIO
     from PIL import Image, ImageDraw
     night = kind == "night"
@@ -227,10 +265,10 @@ def render_placeholder(c: "CameraConfig", kind: str, values: dict, size: tuple[i
         bg = (22, 30, 46) if night else (44, 46, 50)
         im = Image.new("RGB", (w, h), bg)
     d = ImageDraw.Draw(im)
-    u = min(w, h * 16 / 9) / 100                 # Maßeinheit: 1 % der (16:9-)Breite
+    u = min(w, h * 16 / 9) / 100                 # unit: 1 % of the (16:9) width
     lines = [ln for ln in text.split("\n")] if text else []
 
-    if not path:                                 # Symbol über dem Text
+    if not path:                                 # symbol above the text
         cx, cy = w / 2, h * (0.30 if lines else 0.5)
         if night:
             r = 7 * u
@@ -240,21 +278,21 @@ def render_placeholder(c: "CameraConfig", kind: str, values: dict, size: tuple[i
             for sx, sy, sr in ((-22, -6, .5), (18, -9, .4), (27, 4, .35), (-30, 7, .4), (-12, -13, .3), (13, -15, .3)):
                 x, y, rr = cx + sx * u, cy + sy * u, sr * u
                 d.ellipse((x - rr, y - rr, x + rr, y + rr), fill=(220, 225, 240))
-        else:                                    # durchgestrichene Kamera
+        else:                                    # crossed-out camera
             fg = (230, 230, 230)
             bw, bh = 18 * u, 11.5 * u
             x0, y0 = cx - bw / 2, cy - bh / 2 + 1.0 * u
             my = y0 + bh / 2
-            d.rounded_rectangle((x0 + 2.5 * u, y0 - 2.2 * u, x0 + 7.5 * u, y0 + u), radius=0.7 * u, fill=fg)  # Sucher
-            d.rounded_rectangle((x0, y0, x0 + bw, y0 + bh), radius=1.8 * u, fill=fg)                          # Gehäuse
+            d.rounded_rectangle((x0 + 2.5 * u, y0 - 2.2 * u, x0 + 7.5 * u, y0 + u), radius=0.7 * u, fill=fg)  # viewfinder
+            d.rounded_rectangle((x0, y0, x0 + bw, y0 + bh), radius=1.8 * u, fill=fg)                          # body
             r = 3.8 * u
-            d.ellipse((cx - r, my - r, cx + r, my + r), fill=bg)                                               # Objektiv
+            d.ellipse((cx - r, my - r, cx + r, my + r), fill=bg)                                               # lens
             r2 = 2.1 * u
             d.ellipse((cx - r2, my - r2, cx + r2, my + r2), fill=fg)
-            d.ellipse((x0 + bw - 3.4 * u, y0 + 1.5 * u, x0 + bw - 1.7 * u, y0 + 3.2 * u), fill=bg)            # Blitz
+            d.ellipse((x0 + bw - 3.4 * u, y0 + 1.5 * u, x0 + bw - 1.7 * u, y0 + 3.2 * u), fill=bg)            # flash
             a, b = (cx - 11.5 * u, my - 8.5 * u), (cx + 11.5 * u, my + 8.5 * u)
-            d.line((a, b), fill=bg, width=round(3.8 * u))                                                  # Spalt
-            d.line((a, b), fill=(225, 60, 50), width=round(1.6 * u))                                       # Strich
+            d.line((a, b), fill=bg, width=round(3.8 * u))                                                  # gap
+            d.line((a, b), fill=(225, 60, 50), width=round(1.6 * u))                                       # stroke
 
     y = h * (0.50 if not path else 0.5 - 0.06 * len(lines))
     for i, ln in enumerate(lines):
@@ -270,8 +308,9 @@ def render_placeholder(c: "CameraConfig", kind: str, values: dict, size: tuple[i
                stroke_width=stroke, stroke_fill=(0, 0, 0))
         y += (b - t) + (2.2 if i == 0 else 1.4) * u
 
+    now = dt.datetime.now()
     foot = c.name if "{time}" in (c.night_text if night else c.offline_text) else \
-        f"{c.name} · Stand {dt.datetime.now():%d.%m.%Y %H:%M}"
+        f"{c.name} · {TEXTS.get(c.language, TEXTS['en'])['as_of']} {fmt_date(now, c.language)} {now:%H:%M}"
     f = _font(max(10, round(1.9 * u)))
     l, t, r, b = d.textbbox((0, 0), foot, font=f, stroke_width=1)
     d.text((1.5 * u - l, h - 1.5 * u - b), foot, font=f, fill=(190, 190, 190), stroke_width=1, stroke_fill=(0, 0, 0))
@@ -281,24 +320,24 @@ def render_placeholder(c: "CameraConfig", kind: str, values: dict, size: tuple[i
 
 
 def postprocess(img: bytes, c: "CameraConfig") -> bytes:
-    """Verkleinert/weichzeichnet das Bild und entfernt Metadaten. Original wird verworfen."""
+    """Shrinks/blurs the picture and strips metadata. The original is discarded."""
     if not c.max_width and not c.blur and not c.face_blur:
         return img
     from io import BytesIO
     from PIL import Image, ImageFilter
     im = Image.open(BytesIO(img))
-    im = im.convert("RGB")                      # verwirft auch EXIF/Metadaten
-    if c.face_blur:                             # auf dem Original, damit auch kleinere Gesichter gefunden werden
+    im = im.convert("RGB")                      # also drops EXIF/metadata
+    if c.face_blur:                             # on the original, so that smaller faces are found too
         try:
             import tapo_faces
             t0 = time.time()
             faces = tapo_faces.detect(im, c.face_threshold)
             if faces:
                 im = tapo_faces.anonymize(im, faces, c.face_margin)
-                log.info("[%s] %d Gesicht(er) unkenntlich gemacht (%.1f s)", c.name, len(faces), time.time() - t0)
+                log.info("[%s] %d face(s) anonymised (%.1f s)", c.name, len(faces), time.time() - t0)
         except Exception as e:  # noqa: BLE001
-            # lieber ein unbrauchbares als ein ungeschütztes Bild
-            log.error("[%s] Gesichtserkennung fehlgeschlagen (%r) – ganzes Bild wird weichgezeichnet", c.name, e)
+            # better an unusable picture than an unprotected one
+            log.error("[%s] face detection failed (%r) – blurring the whole picture", c.name, e)
             im = im.filter(ImageFilter.GaussianBlur(max(8, im.width / 80)))
     if c.max_width and im.width > c.max_width:
         h = round(im.height * c.max_width / im.width)
@@ -311,7 +350,7 @@ def postprocess(img: bytes, c: "CameraConfig") -> bytes:
 
 
 def parse_battery(res) -> tuple[int | None, str | None]:
-    """Sucht Ladestand (%) und Ladezustand in der Antwort von getBatteryStatus."""
+    """Finds charge level (%) and charging state in the getBatteryStatus response."""
     pct: int | None = None
     chg: str | None = None
 
@@ -340,41 +379,43 @@ def parse_battery(res) -> tuple[int | None, str | None]:
 
 
 def load_config(path: str, need_upload: bool = True) -> Config:
-    """need_upload=False: unvollständiges [upload] (z. B. Passwort nur im env des Dienstes) ist kein Fehler,
-    der Upload ist dann einfach aus."""
+    """need_upload=False: an incomplete [upload] (e.g. password only in the service's env file) is not an
+    error, uploading is simply disabled."""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     cams = []
-    defaults = raw.pop("defaults", {})       # gilt für alle Kameras, einzeln überschreibbar
+    defaults = raw.pop("defaults", {})       # applies to all cameras, can be overridden per camera
     for c in raw.pop("camera", []):
         c = {**defaults, **c}
-        # Passwort darf auch aus Umgebungsvariable kommen (z. B. Docker-Secret)
+        # the password may also come from an environment variable (e.g. a Docker secret)
         pw = c.get("password") or os.environ.get(c.get("password_env", "TAPO_PASSWORD"), "")
         c.pop("password_env", None)
         c["password"] = pw
         cams.append(CameraConfig(**c))
     if not cams:
-        raise SystemExit("Keine [[camera]] in der Konfiguration gefunden.")
+        raise SystemExit("No [[camera]] found in the configuration.")
     for c in cams:
         if c.connection not in ("local", "cloud"):
-            raise SystemExit(f"Kamera '{c.name}': connection muss local|cloud sein.")
+            raise SystemExit(f"Camera '{c.name}': connection must be local|cloud.")
         if c.connection == "local" and not (c.host and c.password):
-            raise SystemExit(f"Kamera '{c.name}': host und password nötig (connection=local).")
+            raise SystemExit(f"Camera '{c.name}': host and password required (connection=local).")
         parse_hours(c.active_hours, c.name)
         if c.face_blur:
             import tapo_faces
             problem = tapo_faces.check_available()
             if problem:
-                raise SystemExit(f"Kamera '{c.name}': face_blur = true, aber {problem}.")
+                raise SystemExit(f"Camera '{c.name}': face_blur = true, but {problem}.")
         parse_days(c.active_days, c.name)
         if c.connection == "cloud" and not c.cloud_device:
-            raise SystemExit(f"Kamera '{c.name}': cloud_device nötig (Name aus `cloud-login`).")
+            raise SystemExit(f"Camera '{c.name}': cloud_device required (name shown by `cloud-login`).")
         if c.mode not in ("auto", "snapshot", "stream"):
-            raise SystemExit(f"Kamera '{c.name}': mode muss auto|snapshot|stream sein.")
+            raise SystemExit(f"Camera '{c.name}': mode must be auto|snapshot|stream.")
+        if c.language not in TEXTS:
+            raise SystemExit(f"Camera '{c.name}': language must be one of {', '.join(TEXTS)}.")
         for key in ("night_image", "offline_image"):
             p = getattr(c, key)
             if p and not os.access(p, os.R_OK):
-                raise SystemExit(f"Kamera '{c.name}': {key} '{p}' nicht lesbar (Rechte für den Dienstbenutzer?).")
+                raise SystemExit(f"Camera '{c.name}': {key} '{p}' not readable (permissions for the service user?).")
     up = raw.pop("upload", None)
     upload = None
     if up:
@@ -387,9 +428,9 @@ def load_config(path: str, need_upload: bool = True) -> Config:
             raise SystemExit(f"[upload]: {e}")
         problem = None
         if not (upload.host and upload.user and (upload.password or upload.key)):
-            problem = "[upload]: host, user und key oder password (bzw. SFTP_PASSWORD) nötig."
+            problem = "[upload]: host, user and key or password (or SFTP_PASSWORD) required."
         elif upload.key and not os.access(upload.key, os.R_OK):
-            problem = f"[upload]: Schlüssel '{upload.key}' nicht lesbar."
+            problem = f"[upload]: key '{upload.key}' not readable."
         if problem:
             if need_upload:
                 raise SystemExit(problem)
@@ -402,10 +443,10 @@ def load_config(path: str, need_upload: bool = True) -> Config:
 
 
 # --------------------------------------------------------------------------- #
-# SFTP-Upload
+# SFTP upload
 # --------------------------------------------------------------------------- #
 class Uploader:
-    """Lädt Bilder per SFTP hoch (paramiko). Erst als .tmp, dann umbenannt -> nie halbe Dateien."""
+    """Uploads pictures via SFTP (paramiko). Written as .tmp first, then renamed -> never half a file."""
 
     def __init__(self, uc: UploadConfig):
         self.uc = uc
@@ -423,12 +464,12 @@ class Uploader:
         kh = Path(self.uc.known_hosts)
 
         class Tofu(paramiko.MissingHostKeyPolicy):
-            # erster Kontakt: Host-Schlüssel merken; ändert er sich später, bricht paramiko ab
+            # first contact: remember the host key; if it changes later, paramiko refuses to connect
             def missing_host_key(self, client, hostname, key):
                 client.get_host_keys().add(hostname, key.get_name(), key)
                 kh.parent.mkdir(parents=True, exist_ok=True)
                 client.save_host_keys(str(kh))
-                log.warning("SFTP: Host-Schlüssel von %s gespeichert (%s %s)", hostname, key.get_name(),
+                log.warning("SFTP: host key of %s saved (%s %s)", hostname, key.get_name(),
                             key.fingerprint if hasattr(key, "fingerprint") else key.get_base64()[:24])
 
         cli = paramiko.SSHClient()
@@ -458,7 +499,7 @@ class Uploader:
                 pass
             try:
                 sftp.posix_rename(tmp, final)
-            except OSError:                    # Server ohne posix-rename: alte Datei erst löschen
+            except OSError:                    # server without posix-rename: delete the old file first
                 try:
                     sftp.remove(final)
                 except OSError:
@@ -477,11 +518,10 @@ class Uploader:
                                               self.uc.timeout * 3)
             except Exception as e:  # noqa: BLE001
                 self.last_error[c.name] = f"{type(e).__name__}: {e}"
-                log.warning("[%s] SFTP-Upload nach %s fehlgeschlagen: %s", c.name, self.uc.host,
-                            self.last_error[c.name])
+                log.warning("[%s] SFTP upload to %s failed: %s", c.name, self.uc.host, self.last_error[c.name])
                 return False
             self.last_ok[c.name], self.last_error[c.name] = time.time(), None
-            log.info("[%s] hochgeladen: %s:%s (%d KB, %.1f s)", c.name, self.uc.host, path,
+            log.info("[%s] uploaded: %s:%s (%d KB, %.1f s)", c.name, self.uc.host, path,
                      len(data) // 1024, time.time() - t0)
             return True
 
@@ -492,7 +532,7 @@ class Uploader:
 
 
 # --------------------------------------------------------------------------- #
-# Cloud-Zugang (ontapo) – eine Sitzung für alle Cloud-Kameras
+# Cloud access (ontapo) – one session for all cloud cameras
 # --------------------------------------------------------------------------- #
 class CloudAccount:
     _instance: "CloudAccount | None" = None
@@ -535,7 +575,7 @@ class CloudAccount:
 
     async def _open(self):
         if not self.session_file.exists():
-            raise RuntimeError(f"Keine Cloud-Sitzung ({self.session_file}). Erst `cloud-login` ausführen.")
+            raise RuntimeError(f"No cloud session ({self.session_file}). Run `cloud-login` first.")
         self.data = json.loads(self.session_file.read_text())
         self._build()
         await self._load_devices()
@@ -550,16 +590,16 @@ class CloudAccount:
                 cams = await self.session.cameras()
                 if cams:
                     break
-                tried.append(f"{region}: leer")
+                tried.append(f"{region}: empty")
             except Unauthorized:
                 raise
             except Exception as e:  # noqa: BLE001
                 err = e
                 tried.append(f"{region}: {e!r}")
         if not cams:
-            raise RuntimeError(f"Keine Kameras gefunden ({'; '.join(tried)})") from err
+            raise RuntimeError(f"No cameras found ({'; '.join(tried)})") from err
         if tried:
-            log.info("Cloud-Region %s verwendet (vorher probiert: %s)", self.data["region"], "; ".join(tried))
+            log.info("Using cloud region %s (tried before: %s)", self.data["region"], "; ".join(tried))
             self._save()
         self.devices = {}
         for c in cams:
@@ -571,7 +611,7 @@ class CloudAccount:
     async def _refresh(self):
         from ontapo._crypto import APP_VERSION
         from tapo_cloud_auth import refresh_session
-        log.info("Cloud-Token wird erneuert …")
+        log.info("Refreshing cloud token …")
         self.data = await refresh_session(self.data, APP_VERSION, log=log.debug)
         self._save()
         self._build()
@@ -584,33 +624,33 @@ class CloudAccount:
             try:
                 return await self._snapshot_once(device, timeout, seconds)
             except RelayError as e:
-                # 404 = Kamera (noch) nicht am Relay angemeldet, typisch beim Aufwachen von Akku-Kameras
+                # 404 = camera not (yet) registered at the relay, typical while a battery camera wakes up
                 msg = str(e)
                 if "HTTP 404" not in msg and "no video data" not in msg and "ended before" not in msg:
                     raise
                 last = e
                 if n < retries:
-                    log.info("Kamera '%s' noch nicht bereit (%s) – neuer Versuch in %.0f s (%d/%d)",
+                    log.info("Camera '%s' not ready yet (%s) – retrying in %.0f s (%d/%d)",
                              device, msg, retry_wait, n + 1, retries)
                     await asyncio.sleep(retry_wait)
-        raise RuntimeError(f"Kamera '{device}' nach {retries + 1} Versuchen nicht erreichbar: {last} – "
-                           f"Akku leer, offline oder WLAN-Problem? Livebild in der Tapo-App prüfen.")
+        raise RuntimeError(f"Camera '{device}' unreachable after {retries + 1} attempts: {last} – "
+                           f"battery empty, offline or Wi-Fi problem? Check the live view in the Tapo app.")
 
     async def battery(self, device: str, timeout: float = 15.0) -> dict:
-        """getBatteryStatus über die Cloud. Nur direkt nach einem Bild aufrufen (Kamera wach)."""
+        """getBatteryStatus via the cloud. Only call right after a picture (camera awake)."""
         async with self.lock:
             if self.session is None:
                 await self._open()
             dev_id = self.devices.get(device) or self.devices.get(device.lower())
             if not dev_id:
-                raise RuntimeError(f"Kamera '{device}' nicht im Konto gefunden")
+                raise RuntimeError(f"Camera '{device}' not found in the account")
             return await asyncio.wait_for(
                 self.session.request(dev_id, "getBatteryStatus", {"battery": {"name": "status"}}), timeout)
 
     async def _snapshot_once(self, device: str, timeout: int, seconds: float) -> bytes:
         from ontapo.errors import Unauthorized
         import tempfile
-        async with self.lock:                  # Relay-Sitzungen nacheinander
+        async with self.lock:                  # relay sessions one after another
             for attempt in range(2):
                 try:
                     if self.session is None:
@@ -621,7 +661,7 @@ class CloudAccount:
                         dev_id = self.devices.get(device) or self.devices.get(device.lower())
                     if not dev_id:
                         names = sorted(k for k, v in self.devices.items() if k != v)
-                        raise RuntimeError(f"Kamera '{device}' nicht im Konto gefunden. Vorhanden: {names}")
+                        raise RuntimeError(f"Camera '{device}' not found in the account. Available: {names}")
                     dev = self.session.device(dev_id, name=device)
                     with tempfile.TemporaryDirectory() as td:
                         out = os.path.join(td, "snap.jpg")
@@ -631,11 +671,11 @@ class CloudAccount:
                     if attempt:
                         raise
                     await self._refresh()
-        raise RuntimeError("unerreichbar")
+        raise RuntimeError("unreachable")
 
 
 # --------------------------------------------------------------------------- #
-# Kamerazugriff
+# Camera access
 # --------------------------------------------------------------------------- #
 class Camera:
     def __init__(self, cfg: CameraConfig, cloud: "CloudAccount | None" = None, state_dir: Path | None = None,
@@ -643,16 +683,16 @@ class Camera:
         self.cfg = cfg
         self.cloud = cloud
         self.uploader = uploader if cfg.upload else None
-        self.placeholder: str | None = None   # gerade gezeigter Platzhalter ("night"/"offline")
-        self.failures = 0                     # fehlgeschlagene Intervall-Aufnahmen in Folge
+        self.placeholder: str | None = None   # placeholder currently shown ("night"/"offline")
+        self.failures = 0                     # failed interval captures in a row
         self._tapo = None
         self._lock = asyncio.Lock()
         self.last_image: bytes | None = None
         self.last_time: float = 0.0
         self.last_error: str | None = None
         self.last_method: str | None = None
-        self._snapshot_misses = 0            # zählt, wie oft das native Standbild leer blieb
-        self.battery: int | None = None      # letzter Akkustand in %
+        self._snapshot_misses = 0            # how often the native still image came back empty
+        self.battery: int | None = None      # last battery level in %
         self.battery_charging: str | None = None
         self.battery_time: float = 0.0
         self.battery_task: asyncio.Task | None = None
@@ -661,12 +701,12 @@ class Camera:
         self._state_file = (state_dir / cfg.name / ".battery.json") if state_dir else None
         self._load_battery()
 
-    # --- Akkuschutz -----------------------------------------------------------
+    # --- battery protection ----------------------------------------------------
     def _load_battery(self):
         try:
             d = json.loads(self._state_file.read_text())
             self.battery, self.battery_charging, self.battery_time = d["percent"], d.get("charging"), d["time"]
-        except Exception:  # noqa: BLE001  (noch keine Messung / kein Zustand)
+        except Exception:  # noqa: BLE001  (no reading / no state yet)
             pass
 
     def _save_battery(self):
@@ -677,30 +717,30 @@ class Camera:
             self._state_file.write_text(json.dumps({"percent": self.battery, "charging": self.battery_charging,
                                                     "time": self.battery_time}))
         except OSError as e:
-            log.warning("[%s] Akkustand nicht gespeichert: %s", self.cfg.name, e)
+            log.warning("[%s] could not save battery level: %s", self.cfg.name, e)
 
     async def update_battery(self):
-        """Akkustand lesen – nur direkt nach einer Aufnahme, solange die Kamera wach ist."""
+        """Read the battery level – only right after a capture, while the camera is awake."""
         if not self.cloud:
             return
         try:
             res = await self.cloud.battery(self.cfg.cloud_device)
         except Exception as e:  # noqa: BLE001
             if not self._battery_warned:
-                log.warning("[%s] Akkustand nicht abrufbar: %r", self.cfg.name, e)
+                log.warning("[%s] battery level not available: %r", self.cfg.name, e)
                 self._battery_warned = True
             return
         pct, chg = parse_battery(res)
         if pct is None:
-            log.warning("[%s] Akkustand in der Antwort nicht gefunden: %s", self.cfg.name, json.dumps(res)[:300])
+            log.warning("[%s] battery level not found in response: %s", self.cfg.name, json.dumps(res)[:300])
             return
         self._battery_warned = False
         self.battery, self.battery_charging, self.battery_time = pct, chg, time.time()
-        log.info("[%s] Akku %d %%%s", self.cfg.name, pct, f" (Laden: {chg})" if chg else "")
+        log.info("[%s] battery %d %%%s", self.cfg.name, pct, f" (charging: {chg})" if chg else "")
         self._save_battery()
 
     def battery_paused_until(self) -> float | None:
-        """Zeitpunkt, bis zu dem wegen schwachem Akku pausiert wird – sonst None."""
+        """Time until which captures pause because of a low battery – otherwise None."""
         c = self.cfg
         if not c.battery_min or self.battery is None or self.battery >= c.battery_min:
             return None
@@ -709,10 +749,10 @@ class Camera:
 
     @property
     def _snapshot_unsupported(self) -> bool:
-        # nach 3 leeren Antworten in Folge direkt den Stream nehmen (spart Zeit und Akku)
+        # after 3 empty answers in a row go straight to the stream (saves time and battery)
         return self._snapshot_misses >= 3
 
-    # pytapo arbeitet beim Login synchron (requests) -> in Thread auslagern
+    # pytapo logs in synchronously (requests) -> run in a thread
     def _connect_sync(self):
         from pytapo import Tapo
         c = self.cfg
@@ -725,25 +765,25 @@ class Camera:
 
     async def tapo(self):
         if self._tapo is None:
-            log.info("[%s] Verbinde mit %s …", self.cfg.name, self.cfg.host)
+            log.info("[%s] connecting to %s …", self.cfg.name, self.cfg.host)
             self._tapo = await asyncio.to_thread(self._connect_sync)
         return self._tapo
 
     def reset(self):
         self._tapo = None
 
-    # --- Methode 1: natives Standbild (schnell, ~640x360) -------------------
+    # --- method 1: native still image (fast, ~640x360) -------------------------
     async def _grab_snapshot(self) -> bytes | None:
         from pytapo.media_stream.snapshot import getSnapshot
         tapo = await self.tapo()
         return await getSnapshot(tapo, timeout=self.cfg.timeout)
 
-    # --- Methode 2: ein Frame aus dem Live-Stream (volle Auflösung) ---------
+    # --- method 2: one frame from the live stream (full resolution) ------------
     async def _grab_stream_frame(self) -> bytes | None:
         from pytapo.media_stream._utils import StreamType
         tapo = await self.tapo()
         if shutil.which("ffmpeg") is None:
-            raise RuntimeError("ffmpeg nicht gefunden (für mode=stream nötig)")
+            raise RuntimeError("ffmpeg not found (required for mode=stream)")
 
         ff = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error", "-probesize", "512k", "-analyzeduration", "1M",
@@ -771,7 +811,7 @@ class Camera:
                     if resp.mimetype != "video/mp2t":
                         continue
                     buf += resp.plaintext
-                    # auf 188-Byte-TS-Pakete ausrichten
+                    # align to 188-byte TS packets
                     while len(buf) >= 188 and buf[0] != 0x47:
                         pos = buf.find(0x47, 1)
                         if pos == -1:
@@ -792,19 +832,19 @@ class Camera:
             out, err = await asyncio.wait_for(ff.communicate(), timeout=self.cfg.timeout + 5)
         except asyncio.TimeoutError:
             ff.kill()
-            raise RuntimeError("Zeitüberschreitung beim Lesen des Streams")
+            raise RuntimeError("timeout while reading the stream")
         finally:
             feeder.cancel()
             try:
                 await feeder
-            except (asyncio.CancelledError, Exception):  # Session-Abbau darf scheitern
+            except (asyncio.CancelledError, Exception):  # session teardown may fail
                 pass
         if ff.returncode != 0 or not out:
-            raise RuntimeError(f"ffmpeg lieferte kein Bild: {err.decode(errors='ignore')[-300:]}")
+            raise RuntimeError(f"ffmpeg returned no picture: {err.decode(errors='ignore')[-300:]}")
         return out
 
     async def capture(self, force: bool = False) -> bytes:
-        """Liefert ein JPEG. Nutzt Cache, damit Akku-Kameras nicht ständig geweckt werden."""
+        """Returns a JPEG. Uses a cache so that battery cameras are not woken up constantly."""
         async with self._lock:
             age = time.time() - self.last_time
             if not force and self.last_image and age < self.cfg.cache_seconds:
@@ -818,15 +858,15 @@ class Camera:
                                                     retry_wait=self.cfg.cloud_retry_wait)
                 except Exception as e:  # noqa: BLE001
                     self.last_error = f"cloud: {e!r}"
-                    log.debug("[%s] cloud fehlgeschlagen", self.cfg.name, exc_info=True)
+                    log.debug("[%s] cloud failed", self.cfg.name, exc_info=True)
                     raise RuntimeError(self.last_error)
                 if img[:2] != b"\xff\xd8":
-                    self.last_error = "cloud: kein JPEG"
+                    self.last_error = "cloud: not a JPEG"
                     raise RuntimeError(self.last_error)
                 img = await asyncio.to_thread(postprocess, img, self.cfg)
                 self.last_image, self.last_time = img, time.time()
                 self.last_error, self.last_method = None, "cloud"
-                log.info("[%s] Bild aufgenommen (cloud, %d KB)", self.cfg.name, len(img) // 1024)
+                log.info("[%s] picture taken (cloud, %d KB)", self.cfg.name, len(img) // 1024)
                 if self.battery_task is None or self.battery_task.done():
                     self.battery_task = asyncio.create_task(self.update_battery())
                 return img
@@ -835,7 +875,7 @@ class Camera:
             methods = {"snapshot": ["snapshot"], "stream": ["stream"],
                        "auto": (["stream"] if self._snapshot_unsupported else ["snapshot", "stream"])}[mode]
             errors = []
-            for attempt in range(2):           # 2. Runde mit frischem Login
+            for attempt in range(2):           # second round with a fresh login
                 for m in methods:
                     try:
                         img = await (self._grab_snapshot() if m == "snapshot" else self._grab_stream_frame())
@@ -845,21 +885,21 @@ class Camera:
                             self.last_error, self.last_method = None, m
                             if m == "snapshot":
                                 self._snapshot_misses = 0
-                            log.info("[%s] Bild aufgenommen (%s, %d KB)", self.cfg.name, m, len(img) // 1024)
+                            log.info("[%s] picture taken (%s, %d KB)", self.cfg.name, m, len(img) // 1024)
                             return img
-                        errors.append(f"{m}: kein Bild")
+                        errors.append(f"{m}: no picture")
                         if m == "snapshot":
                             self._snapshot_misses += 1
                     except Exception as e:  # noqa: BLE001
                         errors.append(f"{m}: {e!r}")
-                        log.debug("[%s] %s fehlgeschlagen", self.cfg.name, m, exc_info=True)
+                        log.debug("[%s] %s failed", self.cfg.name, m, exc_info=True)
                 self.reset()
             self.last_error = "; ".join(errors)
             raise RuntimeError(self.last_error)
 
 
 # --------------------------------------------------------------------------- #
-# Ablage
+# Storage
 # --------------------------------------------------------------------------- #
 def save_image(cfg: Config, cam: str, img: bytes, tag: str | None = None) -> Path:
     now = dt.datetime.now()
@@ -868,7 +908,7 @@ def save_image(cfg: Config, cam: str, img: bytes, tag: str | None = None) -> Pat
     latest = base / "latest.jpg"
     tmp = base / ".latest.tmp"
     tmp.write_bytes(img)
-    os.replace(tmp, latest)                    # atomar, Webserver sieht nie halbe Dateien
+    os.replace(tmp, latest)                    # atomic, a web server never sees half a file
     if not cfg.keep_history and not tag:
         return latest
     day = base / now.strftime("%Y/%m/%d")
@@ -882,7 +922,7 @@ def save_image(cfg: Config, cam: str, img: bytes, tag: str | None = None) -> Pat
 
 
 def save_latest(cfg: Config, cam: str, img: bytes) -> Path:
-    """Nur latest.jpg ersetzen (für Platzhalter – nicht ins Archiv)."""
+    """Replace latest.jpg only (for placeholders – not archived)."""
     base = cfg.output_dir / cam
     base.mkdir(parents=True, exist_ok=True)
     tmp, latest = base / ".latest.tmp", base / "latest.jpg"
@@ -892,7 +932,7 @@ def save_latest(cfg: Config, cam: str, img: bytes) -> Path:
 
 
 async def store(cfg: Config, cam: "Camera", img: bytes, tag: str | None = None) -> Path:
-    """Echtes Kamerabild speichern und (im Hintergrund) hochladen."""
+    """Store a real camera picture and upload it (in the background)."""
     path = await asyncio.to_thread(save_image, cfg, cam.cfg.name, img, tag)
     cam.placeholder = None
     if cam.uploader:
@@ -912,41 +952,41 @@ def _image_size(img: bytes | None) -> tuple[int, int] | None:
 
 
 async def check_pause(cfg: Config, cam: "Camera") -> bool:
-    """True = jetzt keine Intervall-Aufnahme (Nacht oder Akkupause). Setzt ggf. einmal den Platzhalter."""
+    """True = no interval capture now (night or battery pause). Shows the placeholder once if needed."""
     c = cam.cfg
     now = dt.datetime.now()
     if not is_active(c, now):
-        log.debug("[%s] außerhalb des Zeitfensters – keine Aufnahme", c.name)
-        await show_placeholder(cfg, cam, "night", {"next": fmt_when(next_active(c, now), now)})
+        log.debug("[%s] outside the time window – no capture", c.name)
+        await show_placeholder(cfg, cam, "night", {"next": fmt_when(next_active(c, now), now, c.language)})
         return True
     if until := cam.battery_paused_until():
         if cam._pause_logged != until:
-            log.warning("[%s] Akku %d %% < %d %% – keine Intervall-Aufnahmen bis %s", c.name, cam.battery,
-                        c.battery_min, dt.datetime.fromtimestamp(until).strftime("%d.%m. %H:%M"))
+            log.warning("[%s] battery %d %% < %d %% – no interval captures until %s", c.name, cam.battery,
+                        c.battery_min, dt.datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M"))
             cam._pause_logged = until
-        await show_placeholder(cfg, cam, "offline")     # Grund (Akku) wird öffentlich nicht genannt
+        await show_placeholder(cfg, cam, "offline")     # the reason (battery) is not shown publicly
         return True
     return False
 
 
 async def show_placeholder(cfg: Config, cam: "Camera", kind: str, values: dict | None = None):
-    """Platzhalter einmal pro Pause/Störung ablegen und hochladen ('night' | 'offline')."""
+    """Store and upload a placeholder once per pause/outage ('night' | 'offline')."""
     c = cam.cfg
     if not c.placeholders or cam.placeholder == kind:
         return
     now = dt.datetime.now()
-    values = {**(values or {}), "camera": c.name, "time": now.strftime("%H:%M"), "date": now.strftime("%d.%m.%Y")}
+    values = {**(values or {}), "camera": c.name, "time": now.strftime("%H:%M"), "date": fmt_date(now, c.language)}
     try:
         img = await asyncio.to_thread(render_placeholder, c, kind, values, _image_size(cam.last_image))
         await asyncio.to_thread(save_latest, cfg, c.name, img)
     except Exception as e:  # noqa: BLE001
-        log.error("[%s] Platzhalterbild '%s' fehlgeschlagen: %r", c.name, kind, e)
-        cam.placeholder = kind             # nicht jede Runde neu versuchen
+        log.error("[%s] placeholder '%s' failed: %r", c.name, kind, e)
+        cam.placeholder = kind             # do not retry every round
         return
     ok = await cam.uploader.upload(c, img) if cam.uploader else True
-    if ok:                                 # sonst beim nächsten Mal erneut versuchen
+    if ok:                                 # otherwise retry next time
         cam.placeholder = kind
-        log.info("[%s] Platzhalterbild '%s' gesetzt", c.name, kind)
+        log.info("[%s] placeholder '%s' set", c.name, kind)
 
 
 def cleanup(cfg: Config):
@@ -961,7 +1001,7 @@ def cleanup(cfg: Config):
                 f.unlink()
         except FileNotFoundError:
             pass
-    for d in sorted(cfg.output_dir.rglob("*"), reverse=True):   # leere Ordner entfernen
+    for d in sorted(cfg.output_dir.rglob("*"), reverse=True):   # remove empty folders
         if d.is_dir():
             try:
                 d.rmdir()
@@ -970,14 +1010,14 @@ def cleanup(cfg: Config):
 
 
 # --------------------------------------------------------------------------- #
-# Dienst
+# Service
 # --------------------------------------------------------------------------- #
 async def interval_loop(cfg: Config, cam: Camera):
     if cam.cfg.interval <= 0:
         return
-    await check_pause(cfg, cam)            # nach dem Start nachts gleich den Platzhalter setzen
+    await check_pause(cfg, cam)            # after a start at night, set the placeholder right away
     while True:
-        # an "runden" Zeiten ausrichten (z. B. :00, :05, :10 …)
+        # align to "round" times (e.g. :00, :05, :10 …)
         await asyncio.sleep(cam.cfg.interval - (time.time() % cam.cfg.interval))
         if await check_pause(cfg, cam):
             continue
@@ -985,7 +1025,7 @@ async def interval_loop(cfg: Config, cam: Camera):
             img = await cam.capture(force=True)
         except Exception as e:  # noqa: BLE001
             cam.failures += 1
-            log.warning("[%s] Aufnahme fehlgeschlagen (%d× in Folge): %s", cam.cfg.name, cam.failures, e)
+            log.warning("[%s] capture failed (%d× in a row): %s", cam.cfg.name, cam.failures, e)
             if cam.failures >= max(1, cam.cfg.offline_after):
                 await show_placeholder(cfg, cam, "offline")
             continue
@@ -993,7 +1033,7 @@ async def interval_loop(cfg: Config, cam: Camera):
         try:
             await store(cfg, cam, img)
         except Exception as e:  # noqa: BLE001
-            log.warning("[%s] Speichern fehlgeschlagen: %s", cam.cfg.name, e)
+            log.warning("[%s] storing failed: %s", cam.cfg.name, e)
 
 
 async def cleanup_loop(cfg: Config):
@@ -1016,48 +1056,48 @@ def build_app(cfg: Config, cams: dict[str, Camera]):
     def get_cam(request) -> Camera:
         name = request.match_info.get("cam") or next(iter(cams))
         if name not in cams:
-            raise web.HTTPNotFound(text=f"unbekannte Kamera '{name}'")
+            raise web.HTTPNotFound(text=f"unknown camera '{name}'")
         return cams[name]
 
     jpeg_headers = {"Cache-Control": "no-store"}
 
     async def snapshot(request):
-        """Frisches Bild (bzw. Cache < cache_seconds). ?save=1 speichert es zusätzlich."""
+        """Fresh picture (or cached if < cache_seconds). ?save=1 also stores it."""
         cam = get_cam(request)
         try:
             img = await cam.capture(force=request.query.get("force") == "1")
         except Exception as e:  # noqa: BLE001
-            log.warning("[%s] Aufnahme (snapshot.jpg) fehlgeschlagen: %s", cam.cfg.name, e)
+            log.warning("[%s] capture (snapshot.jpg) failed: %s", cam.cfg.name, e)
             return web.json_response({"error": str(e)}, status=502)
         if request.query.get("save") == "1":
             await store(cfg, cam, img)
         return web.Response(body=img, content_type="image/jpeg", headers=jpeg_headers)
 
     async def latest(request):
-        """Zuletzt gespeichertes Bild – weckt die Kamera NICHT (ideal fürs Dashboard)."""
+        """Last stored picture – does NOT wake the camera (ideal for dashboards)."""
         cam = get_cam(request)
         f = cfg.output_dir / cam.cfg.name / "latest.jpg"
         if not f.exists():
-            return web.json_response({"error": "noch kein Bild"}, status=404)
+            return web.json_response({"error": "no picture yet"}, status=404)
         return web.FileResponse(f, headers=jpeg_headers)
 
     async def event_image(request):
-        """Letztes Ereignisbild zu einem Tag, z. B. /eingang/event/klingel.jpg"""
+        """Last event picture for a tag, e.g. /entrance/event/doorbell.jpg"""
         cam = get_cam(request)
         tag = "".join(ch for ch in request.match_info["tag"] if ch.isalnum() or ch in "-_")[:32]
         f = cfg.output_dir / cam.cfg.name / f"latest_{tag}.jpg"
         if not f.exists():
-            return web.json_response({"error": "kein Ereignisbild"}, status=404)
+            return web.json_response({"error": "no event picture"}, status=404)
         return web.FileResponse(f, headers=jpeg_headers)
 
     async def trigger(request):
-        """Ereignis-Aufnahme (z. B. Klingel): nimmt frisch auf, speichert mit Tag, gibt JSON zurück."""
+        """Event capture (e.g. doorbell): takes a fresh picture, stores it with a tag, returns JSON."""
         cam = get_cam(request)
         tag = request.query.get("tag", "event")
         try:
             img = await cam.capture(force=True)
         except Exception as e:  # noqa: BLE001
-            log.warning("[%s] Aufnahme (trigger) fehlgeschlagen: %s", cam.cfg.name, e)
+            log.warning("[%s] capture (trigger) failed: %s", cam.cfg.name, e)
             return web.json_response({"ok": False, "error": str(e)}, status=502)
         path = await store(cfg, cam, img, tag)
         if request.query.get("format") == "jpeg":
@@ -1070,7 +1110,7 @@ def build_app(cfg: Config, cams: dict[str, Camera]):
             name: {"host": c.cfg.host or c.cfg.cloud_device, "mode": c.cfg.mode, "interval": c.cfg.interval,
                    "last_capture": dt.datetime.fromtimestamp(c.last_time).isoformat() if c.last_time else None,
                    "connection": c.cfg.connection,
-                   "active_hours": c.cfg.active_hours or "immer", "active_now": is_active(c.cfg),
+                   "active_hours": c.cfg.active_hours or "always", "active_now": is_active(c.cfg),
                    "face_blur": c.cfg.face_blur,
                    "battery": c.battery, "battery_charging": c.battery_charging,
                    "battery_measured": dt.datetime.fromtimestamp(c.battery_time).isoformat() if c.battery_time else None,
@@ -1092,7 +1132,7 @@ def build_app(cfg: Config, cams: dict[str, Camera]):
     async def index(request):
         links = "".join(
             f'<h2>{n}</h2><img src="/{n}/latest.jpg" style="max-width:100%">'
-            f'<p><a href="/{n}/snapshot.jpg">frisch aufnehmen</a> · <a href="/status">Status</a></p>'
+            f'<p><a href="/{n}/snapshot.jpg">take a fresh picture</a> · <a href="/status">status</a></p>'
             for n in cams)
         return web.Response(text=f"<!doctype html><meta charset=utf-8><title>tapo-webcam</title>"
                                  f"<body style='font-family:sans-serif'>{links}</body>",
@@ -1117,7 +1157,7 @@ async def serve(cfg: Config):
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, cfg.listen, cfg.port).start()
-    log.info("HTTP-API auf http://%s:%d/", cfg.listen, cfg.port)
+    log.info("HTTP API on http://%s:%d/", cfg.listen, cfg.port)
     tasks = [asyncio.create_task(interval_loop(cfg, c)) for c in cams.values()]
     tasks.append(asyncio.create_task(cleanup_loop(cfg)))
     await asyncio.gather(*tasks)
@@ -1141,13 +1181,13 @@ def get_uploader(cfg: Config) -> "Uploader | None":
 
 
 async def cmd_placeholders(cfg: Config, do_upload: bool):
-    """Platzhalterbilder als Vorschau ablegen; mit --upload Testupload – weckt keine Kamera."""
+    """Store placeholder previews; with --upload also a test upload – does not wake any camera."""
     now = dt.datetime.now()
     for c in cfg.cameras:
         nxt = next_active(c, now) if (c.active_hours or c.active_days) else now + dt.timedelta(hours=9)
-        base_vals = {"camera": c.name, "time": now.strftime("%H:%M"), "date": now.strftime("%d.%m.%Y")}
+        base_vals = {"camera": c.name, "time": now.strftime("%H:%M"), "date": fmt_date(now, c.language)}
         imgs = {
-            "night": render_placeholder(c, "night", {**base_vals, "next": fmt_when(nxt, now)}),
+            "night": render_placeholder(c, "night", {**base_vals, "next": fmt_when(nxt, now, c.language)}),
             "offline": render_placeholder(c, "offline", base_vals),
         }
         base = cfg.output_dir / c.name
@@ -1159,26 +1199,26 @@ async def cmd_placeholders(cfg: Config, do_upload: bool):
         up = get_uploader(cfg)
         if do_upload:
             if not up:
-                raise SystemExit("Kein [upload]-Abschnitt in der Konfiguration.")
+                raise SystemExit("No [upload] section in the configuration.")
             name = "tapo-webcam-test.jpg"
             ok = await up.upload(c, imgs["night"], name=name)
-            print(f"{c.name}: Testupload {'ok' if ok else 'FEHLGESCHLAGEN'} -> "
+            print(f"{c.name}: test upload {'ok' if ok else 'FAILED'} -> "
                   f"{up.uc.host}:{up.uc.dir.rstrip('/')}/{name}" + ("" if ok else f"  ({up.last_error[c.name]})"))
             if not ok:
                 sys.exit(1)
 
 
 async def cmd_cloud_login(cfg: Config | None, session_file: str):
-    """Interaktiver Login ins Tapo-Konto (inkl. E-Mail-Code), speichert die Sitzung."""
+    """Interactive sign-in to the Tapo account (incl. e-mail code), stores the session."""
     import getpass
     from ontapo._crypto import APP_VERSION
     from tapo_cloud_auth import CloudLogin
-    email = input("E-Mail des Tapo-Kontos: ").strip()
-    pw = getpass.getpass("Passwort: ")
+    email = input("Tapo account e-mail: ").strip()
+    pw = getpass.getpass("Password: ")
     loop = asyncio.get_running_loop()
 
     async def mfa():
-        return (await loop.run_in_executor(None, input, "Code aus der E-Mail von TP-Link: ")).strip()
+        return (await loop.run_in_executor(None, input, "Code from the TP-Link e-mail: ")).strip()
 
     cl = CloudLogin(email, pw, APP_VERSION)
     try:
@@ -1189,14 +1229,14 @@ async def cmd_cloud_login(cfg: Config | None, session_file: str):
     acc.data = data
     acc._build()
     acc._save()
-    print(f"Sitzung gespeichert in {session_file} (Rechte 600 – enthält Zugangstoken!)")
+    print(f"Session saved to {session_file} (mode 600 – contains access tokens!)")
     try:
         cams = await acc._load_devices()
-        print(f"Kameras im Konto (Region {acc.data['region']}):")
+        print(f"Cameras in the account (region {acc.data['region']}):")
         for c in cams:
             print(f"  cloud_device = \"{c.name}\"   ({c.model}, id {c.device_id})")
     except Exception as e:  # noqa: BLE001
-        print(f"Login ok, aber Kameraliste fehlgeschlagen: {e}")
+        print(f"Login ok, but listing cameras failed: {e}")
     await acc.session.aclose()
 
 
@@ -1210,7 +1250,7 @@ async def cmd_discover(cfg: Config):
                 for cam in await acc.session.cameras():
                     print(f"  {cam.name}  {cam.model}  id {cam.device_id}")
             except Exception as e:  # noqa: BLE001
-                print(f"  Cloud-Fehler: {e}")
+                print(f"  cloud error: {e}")
             continue
         cam = Camera(c)
         print(f"== {c.name} ({c.host}) ==")
@@ -1218,18 +1258,18 @@ async def cmd_discover(cfg: Config):
             tapo = await cam.tapo()
             info = await asyncio.to_thread(tapo.getBasicInfo)
             bi = info.get("device_info", {}).get("basic_info", info)
-            print(f"  Modell: {bi.get('device_model')}  Typ: {bi.get('device_type')}  "
-                  f"Firmware: {bi.get('sw_version')}")
+            print(f"  model: {bi.get('device_model')}  type: {bi.get('device_type')}  "
+                  f"firmware: {bi.get('sw_version')}")
         except Exception as e:  # noqa: BLE001
-            print(f"  Verbindung fehlgeschlagen: {e}")
+            print(f"  connection failed: {e}")
             continue
         try:
             children = await asyncio.to_thread(tapo.getChildDevices)
             for ch in children or []:
-                print(f"  Kindgerät: {ch.get('device_model')}  '{ch.get('alias')}'  "
+                print(f"  child device: {ch.get('device_model')}  '{ch.get('alias')}'  "
                       f"child_id = \"{ch.get('device_id')}\"")
         except Exception:  # noqa: BLE001
-            pass  # kein Hub
+            pass  # not a hub
 
 
 async def cmd_snap(cfg: Config, out: str | None):
@@ -1243,12 +1283,12 @@ async def cmd_snap(cfg: Config, out: str | None):
         print(f"{c.name}: {path}  ({len(img)//1024} KB, {cam.last_method}, {time.time()-t0:.1f}s)")
         if cam.uploader and not out:
             ok = await cam.uploader.upload(c, img)
-            print(f"{c.name}: Upload {'ok' if ok else 'fehlgeschlagen: ' + str(cam.uploader.last_error.get(c.name))}")
+            print(f"{c.name}: upload {'ok' if ok else 'failed: ' + str(cam.uploader.last_error.get(c.name))}")
         if cam.battery_task:
             await cam.battery_task
             if cam.battery is not None:
-                print(f"{c.name}: Akku {cam.battery} %" + (f" (Laden: {cam.battery_charging})"
-                                                           if cam.battery_charging else ""))
+                print(f"{c.name}: battery {cam.battery} %" + (f" (charging: {cam.battery_charging})"
+                                                              if cam.battery_charging else ""))
     acc = CloudAccount._instance
     if acc is not None and acc.session is not None:
         await acc.session.aclose()
@@ -1258,9 +1298,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["discover", "snap", "serve", "cloud-login", "placeholders"])
     ap.add_argument("-c", "--config", default=os.environ.get("TAPO_WEBCAM_CONFIG", "config.toml"))
-    ap.add_argument("-o", "--output", help="bei snap: Zieldatei (nur bei einer Kamera)")
+    ap.add_argument("-o", "--output", help="snap: target file (single camera only)")
     ap.add_argument("--upload", action="store_true",
-                    help="bei placeholders: Nachtbild als tapo-webcam-test.jpg hochladen (Verbindungstest)")
+                    help="placeholders: upload the night picture as tapo-webcam-test.jpg (connection test)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -1285,7 +1325,7 @@ def main():
     except KeyboardInterrupt:
         pass
     except RuntimeError as e:
-        sys.exit(f"Fehler: {e}")
+        sys.exit(f"Error: {e}")
 
 
 if __name__ == "__main__":

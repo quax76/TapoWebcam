@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Installation auf Debian/Raspberry Pi OS/Ubuntu (auch Proxmox-LXC). Als root ausführen.
+# Installation on Debian/Raspberry Pi OS/Ubuntu (also Proxmox LXC). Run as root.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 apt-get update
 apt-get install -y python3 python3-venv ffmpeg fonts-dejavu-core
-python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" || { echo "Python >= 3.11 noetig (Debian 12 / Ubuntu 24.04 / Raspberry Pi OS Bookworm)."; exit 1; }
+python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" || { echo "Python >= 3.11 required (Debian 12 / Ubuntu 24.04 / Raspberry Pi OS Bookworm)."; exit 1; }
 
 id tapo-webcam &>/dev/null || useradd --system --home /var/lib/tapo-webcam --shell /usr/sbin/nologin tapo-webcam
 install -d -o tapo-webcam -g tapo-webcam -m 750 /var/lib/tapo-webcam /var/lib/tapo-webcam/images
@@ -22,11 +22,11 @@ python3 -m venv /opt/tapo-webcam/venv
 
 if [ ! -f /etc/tapo-webcam/config.toml ]; then
   install -m 640 -g tapo-webcam config.example.toml /etc/tapo-webcam/config.toml
-  echo ">> /etc/tapo-webcam/config.toml anlegt – bitte IP und Passwort eintragen."
+  echo ">> /etc/tapo-webcam/config.toml created – please adjust it."
 fi
 if [ ! -f /etc/tapo-webcam/env ]; then
   install -m 600 /dev/null /etc/tapo-webcam/env
-  echo "# TAPO_PASSWORD=dein-tapo-passwort" > /etc/tapo-webcam/env
+  printf '# TAPO_PASSWORD=your-tapo-password\n# SFTP_PASSWORD=your-sftp-password\n' > /etc/tapo-webcam/env
 fi
 
 install -m 644 tapo-webcam.service /etc/systemd/system/
@@ -37,14 +37,14 @@ APP=/opt/tapo-webcam/tapo_webcam.py
 CFG=/etc/tapo-webcam/config.toml
 cat <<EOF
 
-Fertig installiert. Naechste Schritte:
-  1. Tapo-Konto anmelden (E-Mail, Passwort, Code aus der TP-Link-Mail):
+Installation complete. Next steps:
+  1. Sign in to the Tapo account (e-mail, password, code from the TP-Link e-mail):
        sudo -u tapo-webcam $PY $APP cloud-login -c $CFG
-  2. Angezeigten Kameranamen als cloud_device eintragen:
+  2. Enter the camera name shown as cloud_device:
        sudo vi $CFG
-  3. Testbild:
+  3. Test picture:
        sudo -u tapo-webcam $PY $APP snap -c $CFG -o /var/lib/tapo-webcam/test.jpg -v
-  4. Dienst starten:
+  4. Start the service:
        sudo systemctl enable --now tapo-webcam && journalctl -fu tapo-webcam
-  Web-Oberflaeche: http://$(hostname -I | awk '{print $1}'):8099/
+  Web interface: http://$(hostname -I | awk '{print $1}'):8099/
 EOF

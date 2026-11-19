@@ -1,36 +1,35 @@
-# HTTP-API und ioBroker
+# HTTP API and ioBroker
 
-Der Dienst stellt eine kleine HTTP-API bereit (Standard: Port 8099, alle Schnittstellen). Ohne
-`/<kamera>` im Pfad gilt die erste Kamera aus der Konfiguration.
+The service provides a small HTTP API (default: port 8099, all interfaces). Without `/<camera>` in the
+path the first camera from the configuration is used.
 
-## Endpunkte
+## Endpoints
 
-| Methode | Pfad | Wirkung | Weckt Kamera? |
+| Method | Path | Effect | Wakes camera? |
 |---|---|---|---|
-| GET | `/` | Übersichtsseite mit dem letzten Bild jeder Kamera | nein |
-| GET | `/<kamera>/latest.jpg` | Zuletzt gespeichertes Bild (auch Platzhalter) | **nein** |
-| GET | `/<kamera>/snapshot.jpg` | Frisches Bild; innerhalb `cache_seconds` das zwischengespeicherte. `?force=1` erzwingt eine Aufnahme, `?save=1` speichert zusätzlich (Archiv + Upload). | ja |
-| GET/POST | `/<kamera>/trigger?tag=klingel` | Ereignisaufnahme, gespeichert als `HHMMSS_klingel.jpg` und `latest_klingel.jpg`, wird hochgeladen. Antwort JSON; mit `&format=jpeg` das Bild selbst. | ja |
-| GET | `/<kamera>/event/<tag>.jpg` | Letztes Bild zu diesem Ereignis-Tag | nein |
-| GET | `/status` | JSON-Status aller Kameras | nein |
-| GET | `/health` | `{"ok": true}` – auch ohne Token | nein |
+| GET | `/` | Overview page with the last picture of each camera | no |
+| GET | `/<camera>/latest.jpg` | Last stored picture (placeholders included) | **no** |
+| GET | `/<camera>/snapshot.jpg` | Fresh picture; within `cache_seconds` the cached one. `?force=1` forces a capture, `?save=1` also stores it (archive + upload). | yes |
+| GET/POST | `/<camera>/trigger?tag=doorbell` | Event capture, stored as `HHMMSS_doorbell.jpg` and `latest_doorbell.jpg`, uploaded. Response JSON; with `&format=jpeg` the picture itself. | yes |
+| GET | `/<camera>/event/<tag>.jpg` | Last picture for this event tag | no |
+| GET | `/status` | JSON status of all cameras | no |
+| GET | `/health` | `{"ok": true}` – also without token | no |
 
-Bei Fehlern antworten `snapshot.jpg` und `trigger` mit HTTP 502 und `{"error": "…"}`.
+On errors `snapshot.jpg` and `trigger` answer HTTP 502 with `{"error": "…"}`.
 
-Ist `token` gesetzt, muss jede Anfrage (außer `/health`) `?token=…` oder den Header `X-Token: …`
-enthalten, sonst HTTP 401.
+If `token` is set, every request (except `/health`) must contain `?token=…` or the header
+`X-Token: …`, otherwise HTTP 401.
 
-**Für Dashboards immer `latest.jpg` verwenden** – jeder Aufruf von `snapshot.jpg` weckt eine
-Akku-Kamera.
+**Always use `latest.jpg` for dashboards** – every request to `snapshot.jpg` wakes a battery camera.
 
 ## `/status`
 
-Beispiel:
+Example:
 
 ```json
 {
-  "parkplatz": {
-    "host": "Parkplatz",
+  "parking": {
+    "host": "Parking",
     "connection": "cloud",
     "mode": "auto",
     "interval": 900,
@@ -48,7 +47,7 @@ Beispiel:
     "placeholder": null,
     "failures": 0,
     "upload": {
-      "target": "ssh.example.de:html/webcam/webcam.jpg",
+      "target": "ssh.example.com:html/webcam/webcam.jpg",
       "last_ok": "2026-11-19T10:15:10.738",
       "last_error": null
     }
@@ -56,53 +55,53 @@ Beispiel:
 }
 ```
 
-| Feld | Bedeutung |
+| Field | Meaning |
 |---|---|
-| `host` | IP (local) bzw. `cloud_device` (cloud) |
-| `active_now` | Liegt die aktuelle Zeit im Zeitfenster? |
-| `last_capture` | Zeitpunkt des letzten erfolgreichen Bildes seit dem Start |
-| `last_method` | `cloud`, `snapshot` oder `stream` |
-| `last_error` | Letzter Aufnahmefehler (wird bei Erfolg geleert) |
-| `battery`, `battery_charging`, `battery_measured` | Letzte Akkumessung (nur cloud); `battery_charging` ist der Rohwert der Kamera, z. B. `NO` |
-| `battery_min` | Schwelle, `null` = Akkuschutz aus |
-| `battery_paused_until` | Ende der laufenden Akkupause oder `null` |
-| `placeholder` | Aktuell gezeigter Platzhalter: `night`, `offline` oder `null` |
-| `failures` | Fehlgeschlagene Intervall-Aufnahmen in Folge |
-| `upload` | Ziel, letzter erfolgreicher Upload und letzter Fehler; `null` ohne `[upload]` |
+| `host` | IP (local) or `cloud_device` (cloud) |
+| `active_now` | Is the current time inside the time window? |
+| `last_capture` | Time of the last successful picture since start |
+| `last_method` | `cloud`, `snapshot` or `stream` |
+| `last_error` | Last capture error (cleared on success) |
+| `battery`, `battery_charging`, `battery_measured` | Last battery reading (cloud only); `battery_charging` is the camera's raw value, e.g. `NO` |
+| `battery_min` | Threshold, `null` = battery protection off |
+| `battery_paused_until` | End of the current battery pause or `null` |
+| `placeholder` | Placeholder currently shown: `night`, `offline` or `null` |
+| `failures` | Failed interval captures in a row |
+| `upload` | Target, last successful upload and last error; `null` without `[upload]` |
 
-## Beispiele
+## Examples
 
 ```bash
 curl -s http://server:8099/status | python3 -m json.tool
-curl -o bild.jpg "http://server:8099/parkplatz/latest.jpg"
-curl -s "http://server:8099/parkplatz/trigger?tag=klingel"
+curl -o picture.jpg "http://server:8099/parking/latest.jpg"
+curl -s "http://server:8099/parking/trigger?tag=doorbell"
 ```
 
 ## ioBroker
 
-`iobroker/tapo-webcam.js` als neues Skript im JavaScript-Adapter (≥ 7) anlegen und oben anpassen:
+Create `iobroker/tapo-webcam.js` as a new script in the JavaScript adapter (≥ 7) and adjust the top:
 
-| Konstante | Bedeutung |
+| Constant | Meaning |
 |---|---|
-| `BASE_URL` | Adresse des Dienstes, z. B. `http://192.168.1.20:8099` |
-| `TOKEN` | API-Token, falls gesetzt |
-| `CAMERA` | Kameraname aus `config.toml` |
-| `TRIGGERS` | Datenpunkte, die eine Aufnahme auslösen (Klingel, Bewegungsmelder …) mit Tag |
-| `TELEGRAM_INSTANCE` | z. B. `telegram.0`, leer = kein Versand |
+| `BASE_URL` | Address of the service, e.g. `http://192.168.1.20:8099` |
+| `TOKEN` | API token, if set |
+| `CAMERA` | Camera name from `config.toml` |
+| `TRIGGERS` | States that trigger a capture (doorbell, motion sensor …) with a tag |
+| `TELEGRAM_INSTANCE` | e.g. `telegram.0`, empty = do not send |
 
-Das Skript legt unter `0_userdata.0.tapoWebcam.<kamera>` an: `snapshot` (Button), `lastCapture`,
-`lastEvent` (lokale Datei), `lastError`, `latestUrl`, `eventUrl`, `online`. Es fragt jede Minute
-`/status` ab und nimmt bei jedem Trigger sofort ein Bild auf.
+The script creates under `0_userdata.0.tapoWebcam.<camera>`: `snapshot` (button), `lastCapture`,
+`lastEvent` (local file), `lastError`, `latestUrl`, `eventUrl`, `online`. It polls `/status` every
+minute and takes a picture immediately on every trigger.
 
-VIS/VIS-2: Bild-Widget mit der URL `http://<dienst>:8099/<kamera>/latest.jpg` und 60 s Refresh.
+VIS/VIS-2: image widget with the URL `http://<service>:8099/<camera>/latest.jpg` and a 60 s refresh.
 
-Kommt der Klingel-Datenpunkt vom ioBroker-Tapo-Adapter, liegt er unter `tapo.0.<geräte-id>…`;
-jeder andere Datenpunkt funktioniert ebenso.
+If the doorbell state comes from the ioBroker Tapo adapter it lives under `tapo.0.<device-id>…`; any
+other state works just as well.
 
-## Einbindung in eine Website
+## Embedding in a website
 
-Mit SFTP-Upload liegt das Bild unter einem festen Namen auf dem Webserver. Damit Browser es nicht
-zwischenspeichern, einen Zeitstempel anhängen und regelmäßig neu laden:
+With the SFTP upload the picture lives on the web server under a fixed name. To keep browsers from
+caching it, append a timestamp and reload regularly:
 
 ```html
 <img id="webcam" src="/webcam/webcam.jpg" alt="Webcam" style="max-width:100%">

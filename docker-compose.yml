@@ -7,8 +7,8 @@ services:
       - "8099:8099"
     environment:
       - TZ=Europe/Berlin
-      - TAPO_PASSWORD=${TAPO_PASSWORD:-}   # aus .env-Datei (nur connection = "local")
-      - SFTP_PASSWORD=${SFTP_PASSWORD:-}   # aus .env-Datei (nur [upload] mit Passwort)
+      - TAPO_PASSWORD=${TAPO_PASSWORD:-}   # from .env file (connection = "local" only)
+      - SFTP_PASSWORD=${SFTP_PASSWORD:-}   # from .env file ([upload] with password only)
     volumes:
       - ./config.toml:/config/config.toml:ro
       - ./images:/data

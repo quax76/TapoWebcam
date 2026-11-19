@@ -1,5 +1,5 @@
 [Unit]
-Description=Tapo Webcam Snapshot-Dienst
+Description=Tapo Webcam snapshot service
 After=network-online.target
 Wants=network-online.target
 

@@ -1,31 +1,31 @@
 /**
- * ioBroker-Skript (JavaScript-Adapter ≥ 7) für den tapo-webcam-Dienst.
+ * ioBroker script (JavaScript adapter ≥ 7) for the tapo-webcam service.
  *
- *  - legt Datenpunkte unter 0_userdata.0.tapoWebcam.<kamera> an
- *  - aktualisiert sie, wenn der Dienst im Intervall neue Bilder macht (Polling von /status)
- *  - nimmt bei einem Ereignis (Klingel, Bewegungsmelder …) sofort ein Bild auf
- *  - schickt es optional per Telegram
- *  - Datenpunkt "snapshot" auf true setzen = manuelle Aufnahme (z. B. Button in VIS)
+ *  - creates states under 0_userdata.0.tapoWebcam.<camera>
+ *  - updates them when the service takes new interval pictures (polling /status)
+ *  - takes a picture immediately on an event (doorbell, motion sensor …)
+ *  - optionally sends it via Telegram
+ *  - set the state "snapshot" to true = manual capture (e.g. a button in VIS)
  *
- * In VIS/VIS-2 als Bild-URL einfach  http://<dienst-ip>:8099/eingang/latest.jpg  verwenden
- * (weckt die Kamera nicht, zeigt das letzte Intervallbild).
+ * In VIS/VIS-2 simply use  http://<service-ip>:8099/entrance/latest.jpg  as image URL
+ * (does not wake the camera, shows the last interval picture).
  */
 
 const fs = require('fs');
 const path = require('path');
 
-// ======================= Einstellungen =======================
-const BASE_URL = 'http://192.168.1.20:8099';   // wo tapo-webcam läuft
-const TOKEN    = '';                            // falls in config.toml gesetzt
-const CAMERA   = 'eingang';                     // name aus config.toml
+// ======================= Settings =======================
+const BASE_URL = 'http://192.168.1.20:8099';   // where tapo-webcam runs
+const TOKEN    = '';                            // if set in config.toml
+const CAMERA   = 'entrance';                    // name from config.toml
 const TRIGGERS = [
-    // Datenpunkte, bei denen ein Bild ausgelöst wird – anpassen!
-    // { id: 'tapo.0.xxxxxxxx.ring', val: true, tag: 'klingel' },
-    // { id: 'hm-rpc.0.XYZ.1.MOTION', val: true, tag: 'bewegung' },
+    // states that trigger a picture – adjust!
+    // { id: 'tapo.0.xxxxxxxx.ring', val: true, tag: 'doorbell' },
+    // { id: 'hm-rpc.0.XYZ.1.MOTION', val: true, tag: 'motion' },
 ];
-const TELEGRAM_INSTANCE = '';                   // z. B. 'telegram.0' – leer = kein Versand
+const TELEGRAM_INSTANCE = '';                   // e.g. 'telegram.0' – empty = do not send
 const TMP_DIR  = '/tmp/tapo-webcam';
-// =============================================================
+// ========================================================
 
 const ROOT = `0_userdata.0.tapoWebcam.${CAMERA}`;
 const q = (extra = '') => {
@@ -37,13 +37,13 @@ const q = (extra = '') => {
 
 async function ensureStates() {
     const defs = {
-        snapshot:     { type: 'boolean', role: 'button', read: false, write: true, def: false, name: 'Bild jetzt aufnehmen' },
-        lastCapture:  { type: 'string',  role: 'date',   read: true,  write: false, def: '', name: 'Letzte Aufnahme' },
-        lastEvent:    { type: 'string',  role: 'text',   read: true,  write: false, def: '', name: 'Letztes Ereignisbild (Datei)' },
-        lastError:    { type: 'string',  role: 'text',   read: true,  write: false, def: '', name: 'Letzter Fehler' },
-        latestUrl:    { type: 'string',  role: 'url',    read: true,  write: false, def: '', name: 'URL letztes Bild' },
-        eventUrl:     { type: 'string',  role: 'url',    read: true,  write: false, def: '', name: 'URL letztes Ereignisbild' },
-        online:       { type: 'boolean', role: 'indicator.reachable', read: true, write: false, def: false, name: 'Dienst erreichbar' },
+        snapshot:     { type: 'boolean', role: 'button', read: false, write: true, def: false, name: 'Take picture now' },
+        lastCapture:  { type: 'string',  role: 'date',   read: true,  write: false, def: '', name: 'Last capture' },
+        lastEvent:    { type: 'string',  role: 'text',   read: true,  write: false, def: '', name: 'Last event picture (file)' },
+        lastError:    { type: 'string',  role: 'text',   read: true,  write: false, def: '', name: 'Last error' },
+        latestUrl:    { type: 'string',  role: 'url',    read: true,  write: false, def: '', name: 'URL of last picture' },
+        eventUrl:     { type: 'string',  role: 'url',    read: true,  write: false, def: '', name: 'URL of last event picture' },
+        online:       { type: 'boolean', role: 'indicator.reachable', read: true, write: false, def: false, name: 'Service reachable' },
     };
     for (const [k, c] of Object.entries(defs)) {
         if (!existsState(`${ROOT}.${k}`)) await createStateAsync(`${ROOT}.${k}`, c.def, c);
@@ -72,14 +72,14 @@ async function captureEvent(tag) {
         setState(`${ROOT}.eventUrl`, `${BASE_URL}/${CAMERA}/event/${encodeURIComponent(tag)}.jpg${q('t=' + Date.now())}`, true);
         setState(`${ROOT}.lastCapture`, new Date().toISOString(), true);
         setState(`${ROOT}.lastError`, '', true);
-        log(`tapo-webcam: Ereignisbild '${tag}' gespeichert (${file})`);
+        log(`tapo-webcam: event picture '${tag}' saved (${file})`);
         if (TELEGRAM_INSTANCE) {
             sendTo(TELEGRAM_INSTANCE, { text: file, type: 'photo',
                 caption: `${CAMERA}: ${tag} – ${formatDate(new Date(), 'hh:mm:ss')}` });
         }
     } catch (e) {
         setState(`${ROOT}.lastError`, String(e), true);
-        log(`tapo-webcam: Aufnahme fehlgeschlagen: ${e}`, 'warn');
+        log(`tapo-webcam: capture failed: ${e}`, 'warn');
     }
 }
 
@@ -104,7 +104,7 @@ async function pollStatus() {
     }
     on({ id: `${ROOT}.snapshot`, val: true, ack: false }, () => {
         setState(`${ROOT}.snapshot`, false, true);
-        captureEvent('manuell');
+        captureEvent('manual');
     });
     schedule('*/1 * * * *', pollStatus);
     pollStatus();

@@ -1,5 +1,6 @@
-# Konfiguration und Geheimnisse
+# Configuration and secrets
 config.toml
+config.new.toml
 *.toml.bak
 .env
 env
@@ -9,7 +10,7 @@ known_hosts_sftp
 id_*
 sftp_ed25519*
 
-# Bilder und Laufzeitdaten
+# Pictures and runtime data
 images/
 data/
 *.jpg
@@ -22,6 +23,6 @@ __pycache__/
 .venv/
 venv/
 
-# Sicherungen
+# Backups
 *.orig
 *.bak

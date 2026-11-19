@@ -1,10 +1,10 @@
 """
-Gesichter erkennen und unkenntlich machen (OpenCV YuNet, läuft auf der CPU).
+Detect faces and make them unrecognisable (OpenCV YuNet, runs on the CPU).
 
-Die Erkennung läuft auf dem Originalbild in mehreren Größen:
-  * stark verkleinert  -> große Gesichter direkt vor der Kamera
-  * mittel/groß        -> kleinere Gesichter weiter weg
-Gefundene Bereiche werden vergrößert, verpixelt und weichgezeichnet.
+Detection runs on the original picture at several sizes:
+  * strongly downscaled -> large faces right in front of the camera
+  * medium/large        -> smaller faces further away
+Found areas are enlarged, pixelated and blurred.
 """
 from __future__ import annotations
 
@@ -19,15 +19,15 @@ _detectors: dict[tuple[str, float], object] = {}
 
 
 def check_available(model: str | Path | None = None) -> str | None:
-    """None, wenn alles da ist – sonst eine Fehlermeldung."""
+    """None if everything is in place – otherwise an error message."""
     try:
         import cv2  # noqa: F401
         import numpy  # noqa: F401
     except ImportError:
-        return "OpenCV fehlt (pip install opencv-python-headless) – install.sh erneut ausführen"
+        return "OpenCV is missing (pip install opencv-python-headless) – run install.sh again"
     m = Path(model) if model else DEFAULT_MODEL
     if not m.is_file():
-        return f"Gesichtsmodell fehlt: {m}"
+        return f"face model missing: {m}"
     return None
 
 
@@ -43,7 +43,7 @@ def _detector(model: Path, threshold: float):
 
 
 def _scales(width: int) -> list[int]:
-    """Breiten, in denen gesucht wird (nie größer als das Original)."""
+    """Widths to search at (never larger than the original)."""
     widths = [w for w in (640, 1280, 1920) if w < width]
     if width <= 1920 or not widths:
         widths.append(width)
@@ -60,7 +60,7 @@ def _iou(a, b) -> float:
 
 
 def detect(im, threshold: float = 0.6, model: str | Path | None = None) -> list[tuple[float, float, float, float, float]]:
-    """Liefert [(x, y, w, h, score), …] in Koordinaten des übergebenen PIL-Bildes."""
+    """Returns [(x, y, w, h, score), …] in coordinates of the given PIL image."""
     import cv2
     import numpy as np
     model = Path(model) if model else DEFAULT_MODEL
@@ -80,7 +80,7 @@ def detect(im, threshold: float = 0.6, model: str | Path | None = None) -> list[
             for f in faces:
                 x, y, w, h, score = float(f[0]) / s, float(f[1]) / s, float(f[2]) / s, float(f[3]) / s, float(f[-1])
                 found.append((x, y, w, h, score))
-    # doppelte Treffer aus verschiedenen Größen zusammenfassen (größeren behalten)
+    # merge duplicate hits from different sizes (keep the larger one)
     found.sort(key=lambda b: b[2] * b[3], reverse=True)
     merged: list[tuple[float, float, float, float, float]] = []
     for b in found:
@@ -90,19 +90,19 @@ def detect(im, threshold: float = 0.6, model: str | Path | None = None) -> list[
 
 
 def anonymize(im, boxes, margin: float = 0.4):
-    """Verpixelt + weichzeichnet die Bereiche (in place auf einer Kopie). Gibt das neue Bild zurück."""
+    """Pixelates + blurs the areas (on a copy). Returns the new image."""
     from PIL import Image, ImageFilter
     im = im.copy()
     W, H = im.size
     for x, y, w, h, *_ in boxes:
         mx, my = w * margin, h * margin
-        x1, y1 = max(0, int(x - mx)), max(0, int(y - my * 1.3))   # oben etwas mehr (Haare/Stirn)
+        x1, y1 = max(0, int(x - mx)), max(0, int(y - my * 1.3))   # a bit more on top (hair/forehead)
         x2, y2 = min(W, int(x + w + mx)), min(H, int(y + h + my))
         if x2 - x1 < 2 or y2 - y1 < 2:
             continue
         region = im.crop((x1, y1, x2, y2))
         rw, rh = region.size
-        blocks = 6                                                 # ~6 Blöcke über die Gesichtsbreite
+        blocks = 6                                                 # ~6 blocks across the face width
         small = region.resize((max(1, rw * blocks // max(1, int(w))), max(1, rh * blocks // max(1, int(w)))),
                               Image.BILINEAR)
         region = small.resize((rw, rh), Image.NEAREST)

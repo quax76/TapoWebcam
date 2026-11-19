@@ -1,19 +1,19 @@
 """
-Robuster Login ins TP-Link/Tapo-Cloud-Konto für tapo-webcam.
+Robust sign-in to the TP-Link/Tapo cloud account for tapo-webcam.
 
-ontapo 0.1.0 ist auf die Asien-Region (aps1) festgelegt und schickt einen sehr
-knappen Login. Bei europäischen Konten antwortet der Server dann z. B. mit
--20104 "Parameter doesn't exist". Hier wird der Login so aufgebaut wie in der
-App (und wie im Projekt tplink-cloud-api):
+ontapo 0.1.0 is hard-wired to the Asia region (aps1) and sends a very minimal
+login request. For European accounts the server then answers e.g. with
+-20104 "Parameter doesn't exist". Here the login is built the way the app does it
+(and the way the tplink-cloud-api project does):
 
-  1. getAccountStatusAndUrl  -> regionaler Server des Kontos
-  2. login (mit allen Query-Parametern der App)
-  3. ggf. E-Mail-Code (MFA)
+  1. getAccountStatusAndUrl  -> regional server of the account
+  2. login (with all query parameters of the app)
+  3. e-mail code (MFA) if required
 
-Mehrere Varianten (Schlüsselpaare, mit/ohne Regionsabfrage) werden der Reihe
-nach probiert; jeder Schritt wird ohne Passwort/Token protokolliert.
-Das Ergebnis wird als ontapo-kompatible Sitzung gespeichert, ergänzt um die
-erkannte Region, damit auch Gerätesuche und Video-Relay den richtigen Server nehmen.
+Several variants (key pairs, with/without region lookup) are tried in turn;
+every step is logged without password/token.
+The result is stored as an ontapo-compatible session, extended by the detected
+region so that device listing and the video relay use the right server as well.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from typing import Any, Awaitable, Callable
 LOGIN_BASE = "https://n-wap.i.tplinkcloud.com"
 APP_TYPE = "TP-Link_Tapo_Android"
 
-# Schlüsselpaare, die die Login-Schnittstelle akzeptiert (App-Konstanten, keine Geheimnisse des Nutzers)
+# key pairs accepted by the login API (constants of the app, not user secrets)
 KEYSETS = {
     "tapo": ("4d11b6b9d5ea4d19a829adbb9714b057", "6ed7d97f3e73467f8a5bab90b577ba4c"),
     "alt":  ("e37525375f8845999bcc56d5e6faa76d", "314bc6700b3140ca80bc655e527cb062"),
@@ -59,7 +59,7 @@ class CloudLogin:
         self.app_version = app_version
         self.term = uuid.uuid4().hex.upper()
         self.log = log
-        from ontapo._http import new_client      # vertraut TP-Links privater CA
+        from ontapo._http import new_client      # trusts TP-Link's private CA
         self.client = new_client()
 
     async def close(self):
@@ -105,35 +105,35 @@ class CloudLogin:
                 "terminalUUID": self.term, "terminalName": "Pixel 8", "terminalMeta": "Pixel 8"}
 
     async def login(self, mfa: Callable[[], Awaitable[str]]) -> dict:
-        """Liefert dict mit token, refreshToken, terminalUUID, accountBase, region, appServer."""
+        """Returns a dict with token, refreshToken, terminalUUID, accountBase, region, appServer."""
         attempts = []
         for keys in ("tapo", "alt"):
             for discover in (True, False):
                 attempts.append((keys, discover))
         last = None
         for keys, discover in attempts:
-            self.log(f"Login-Variante: Schlüssel={keys}, Regionsabfrage={'ja' if discover else 'nein'}")
+            self.log(f"Login variant: keys={keys}, region lookup={'yes' if discover else 'no'}")
             base = await self._regional(keys) if discover else LOGIN_BASE
             data = await self._post(base, "/api/v2/account/login", self._login_body(), keys)
             res = data.get("result") or {}
             ec = data.get("error_code", 0)
-            # falsche Region -> Server nennt die richtige
+            # wrong region -> the server names the right one
             if not res.get("token") and res.get("appServerUrl") and res["appServerUrl"].rstrip("/") != base:
                 base = res["appServerUrl"].rstrip("/")
                 data = await self._post(base, "/api/v2/account/login", self._login_body(), keys)
                 res, ec = data.get("result") or {}, data.get("error_code", 0)
             if ec in (ERR_WRONG_CREDENTIALS, ERR_ACCOUNT_LOCKED):
-                raise RuntimeError(f"Anmeldung abgelehnt ({ec}: {data.get('msg')}) – E-Mail/Passwort prüfen.")
+                raise RuntimeError(f"Sign-in rejected ({ec}: {data.get('msg')}) – check e-mail/password.")
             if res.get("token"):
                 return self._result(res, base, keys)
             if ec == ERR_MFA_REQUIRED or res.get("MFAProcessId"):
                 return self._result(await self._mfa(base, keys, res, mfa), base, keys)
             last = data
-        raise RuntimeError(f"Keine Login-Variante erfolgreich, letzte Antwort: {json.dumps(_redact(last))[:300]}")
+        raise RuntimeError(f"No login variant succeeded, last response: {json.dumps(_redact(last))[:300]}")
 
     async def _mfa(self, base: str, keys: str, res: dict, mfa) -> dict:
         proc = res.get("MFAProcessId")
-        mfa_type = 2  # E-Mail
+        mfa_type = 2  # e-mail
         if proc:
             await self._post(base, "/api/v2/account/getPushVC4TerminalMFA",
                              {"appType": APP_TYPE, "cloudUserName": self.email, "MFAProcessId": proc,
@@ -147,19 +147,19 @@ class CloudLogin:
         data = await self._post(base, "/api/v2/account/checkMFACodeAndLogin", body, keys)
         r = data.get("result") or {}
         if not r.get("token"):
-            raise RuntimeError(f"E-Mail-Code abgelehnt: {json.dumps(_redact(data))[:200]}")
+            raise RuntimeError(f"E-mail code rejected: {json.dumps(_redact(data))[:200]}")
         return r
 
     def _result(self, res: dict, base: str, keys: str) -> dict:
         region = region_of(base) or region_of(res.get("appServerUrl", "")) or "aps1"
-        self.log(f"Login erfolgreich (Variante {keys}), Region: {region}")
+        self.log(f"Login successful (variant {keys}), region: {region}")
         return {"email": self.email, "token": res["token"], "refreshToken": res.get("refreshToken", ""),
                 "terminalUUID": self.term, "accountBase": base,
                 "appServer": f"{region}-app-server.iot.i.tplinkcloud.com", "region": region}
 
 
 async def refresh_session(d: dict, app_version: str, log=lambda m: None) -> dict:
-    """Erneuert das Token über /api/v2/account/refreshToken; gibt das aktualisierte dict zurück."""
+    """Renews the token via /api/v2/account/refreshToken; returns the updated dict."""
     cl = CloudLogin(d.get("email", ""), "", app_version, log=log)
     cl.term = d.get("terminalUUID") or cl.term
     try:
@@ -172,6 +172,6 @@ async def refresh_session(d: dict, app_version: str, log=lambda m: None) -> dict
             if r.get("token"):
                 d = dict(d, token=r["token"], refreshToken=r.get("refreshToken") or d.get("refreshToken", ""))
                 return d
-        raise RuntimeError(f"Token-Erneuerung fehlgeschlagen ({data.get('error_code')}) – `cloud-login` erneut ausführen.")
+        raise RuntimeError(f"Token refresh failed ({data.get('error_code')}) – run `cloud-login` again.")
     finally:
         await cl.close()
