@@ -1,0 +1,14 @@
+services:
+  tapo-webcam:
+    build: .
+    container_name: tapo-webcam
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    environment:
+      - TZ=Europe/Berlin
+      - TAPO_PASSWORD=${TAPO_PASSWORD:-}   # aus .env-Datei (nur connection = "local")
+      - SFTP_PASSWORD=${SFTP_PASSWORD:-}   # aus .env-Datei (nur [upload] mit Passwort)
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - ./images:/data

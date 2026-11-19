@@ -1,0 +1,9 @@
+pytapo>=3.4.30
+aiohttp>=3.9
+ontapo>=0.1.0      # nur für connection = "cloud"
+pillow>=10            # Verkleinern/Weichzeichnen (max_width, blur), Platzhalterbilder
+paramiko>=3.4         # SFTP-Upload ([upload])
+# Gesichtserkennung (face_blur). Versionen begrenzt: neuere numpy/OpenCV brauchen eine CPU mit
+# x86-64-v2 und laufen z. B. auf dem Proxmox-CPU-Typ "kvm64" nicht.
+numpy>=1.26,<2.3
+opencv-python-headless>=4.8,<4.13

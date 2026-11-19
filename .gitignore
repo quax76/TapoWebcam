@@ -1,0 +1,27 @@
+# Konfiguration und Geheimnisse
+config.toml
+*.toml.bak
+.env
+env
+cloud_session.json
+known_hosts_sftp
+*.key
+id_*
+sftp_ed25519*
+
+# Bilder und Laufzeitdaten
+images/
+data/
+*.jpg
+!docs/img/*.jpg
+.battery.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Sicherungen
+*.orig
+*.bak

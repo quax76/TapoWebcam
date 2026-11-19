@@ -1,0 +1,20 @@
+[Unit]
+Description=Tapo Webcam Snapshot-Dienst
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tapo-webcam
+EnvironmentFile=-/etc/tapo-webcam/env
+ExecStart=/opt/tapo-webcam/venv/bin/python /opt/tapo-webcam/tapo_webcam.py serve -c /etc/tapo-webcam/config.toml
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tapo-webcam
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

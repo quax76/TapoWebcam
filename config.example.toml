@@ -1,0 +1,70 @@
+# tapo-webcam – Konfiguration
+# Kopieren nach config.toml und anpassen.
+
+output_dir     = "/var/lib/tapo-webcam/images"   # Docker: "/data"
+retention_days = 14        # ältere Bilder werden gelöscht (0 = nie)
+keep_history   = true      # false = nur latest.jpg (+ Ereignisbilder) behalten
+listen         = "0.0.0.0"
+port           = 8099
+# token        = "geheim"  # optional: API nur mit ?token=geheim bzw. Header X-Token
+cloud_session_file = "/var/lib/tapo-webcam/cloud_session.json"   # Docker: "/data/cloud_session.json"
+
+# ---- Gemeinsame Einstellungen für alle Kameras (jede Kamera kann sie überschreiben) ----
+[defaults]
+active_hours   = "08:00-19:00"    # Intervall-Aufnahmen nur in diesem Zeitfenster (Serverzeit!)
+# active_days  = "Mo-So"          # optional, z. B. "Sa,So" oder "Mo-Fr"
+max_width      = 1280             # Datenschutz: auf 1280 px Breite verkleinern (0 = Original)
+blur           = 0                # optional zusätzlich weichzeichnen, z. B. 1.5
+output_quality = 80
+face_blur      = false            # Gesichter erkennen und verpixeln (vor dem Verkleinern, auf dem Original)
+# face_threshold = 0.6            # niedriger (z. B. 0.5) = findet mehr Gesichter, aber auch Fehltreffer
+# face_margin    = 0.4            # Rand um das Gesicht, der mit verpixelt wird
+battery_min    = 0                # nur cloud: unter diesem Akkustand (%) Intervall-Aufnahmen pausieren (0 = aus)
+battery_pause_hours = 6           # Pausendauer, danach ein Bild + neue Akku-Messung
+placeholders   = false            # Platzhalterbild als latest.jpg (+ Upload): nachts bzw. "außer Betrieb"
+                                  # (Akkupause oder Kamera/Cloud nicht erreichbar – Grund wird nicht genannt)
+# night_text    = "Es ist Nacht\nNächstes Bild ab {next} Uhr"            # erste Zeile groß; "" = nur Bild
+# offline_text  = "Vorübergehend außer Betrieb\nStand: {date}, {time} Uhr"
+# offline_after = 1               # nach so vielen fehlgeschlagenen Aufnahmen in Folge
+# night_image   = "/etc/tapo-webcam/nacht.jpg"       # eigenes Hintergrundbild (sonst Mond auf dunkelblau)
+# offline_image = "/etc/tapo-webcam/offline.jpg"     # eigenes Hintergrundbild (sonst durchgestrichene Kamera)
+# upload_name   = "webcam.jpg"    # Dateiname auf dem Webserver für diese Kamera (Standard: [upload] name)
+
+# ---- Optional: jedes Bild per SFTP auf einen Webserver laden ----
+# [upload]
+# host = "ssh.example.de"
+# port = 22
+# user = "webcam"
+# key  = "/var/lib/tapo-webcam/.ssh/sftp_ed25519"   # SSH-Schlüssel (empfohlen) …
+# # … oder Passwort: SFTP_PASSWORD=… in /etc/tapo-webcam/env eintragen (nicht hier)
+# dir  = "/html/webcam"           # Zielverzeichnis (muss existieren)
+# name = "{camera}.jpg"           # Dateiname, wird bei jedem Bild überschrieben
+
+# ---- Variante 1: Kamera entfernt, Zugriff über die TP-Link-Cloud (wie die App unterwegs) ----
+# Vorher einmalig:  tapo_webcam.py cloud-login -c config.toml   (fragt E-Mail, Passwort, E-Mail-Code)
+[[camera]]
+name         = "vereinsheim"
+connection   = "cloud"
+cloud_device = "Vereinsheim"       # Kameraname wie in der Tapo-App (zeigt cloud-login an)
+cloud_seconds = 3                  # Sekunden Live-Stream pro Bild (2–4; weniger = akkuschonender)
+interval     = 600                 # alle 10 Minuten
+timeout      = 30
+
+# ---- Variante 2: Kamera im selben Netz (LAN, z. B. Raspberry vor Ort oder per VPN) ----
+# [[camera]]
+# name     = "eingang"               # nur a-z, 0-9, -, _ (wird Teil der URL)
+# connection = "local"
+# host     = "192.168.1.50"         # IP der Kamera – bzw. des Hubs, falls die Kamera am H200 hängt
+# user     = "admin"                 # bleibt "admin"
+# password = ""                      # Passwort deines TP-Link-/Tapo-Kontos (App-Login)
+# password_env = "TAPO_PASSWORD"   # alternativ aus Umgebungsvariable lesen (Standard)
+# child_id = "80xxxxxxxx…"         # NUR bei Kamera am Hub – Wert liefert `discover`
+# mode     = "auto"                  # auto = erst natives Standbild, sonst Frame aus Stream
+#                                    # snapshot = nur natives Standbild (schnell, meist 640x360)
+#                                    # stream   = Frame aus Live-Stream (volle Auflösung, braucht ffmpeg)
+# quality  = "HD"                    # für stream: HD oder VGA
+# interval = 300                     # alle 5 Minuten (Sekunden; 0 = nur auf Anfrage)
+# timeout  = 20
+# cache_seconds = 15                 # Anfragen innerhalb dieser Zeit bekommen dasselbe Bild
+
+# Weitere Kameras einfach als weiteren [[camera]]-Block anhängen.
