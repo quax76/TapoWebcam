@@ -1,14 +1,30 @@
-# TapoWebcam
+# Tapo Webcam @quax76
 
-Macht aus Tapo-Kameras eine **öffentliche Webcam**: Der Dienst holt in festen Abständen ein Standbild,
-schützt die Privatsphäre (Verkleinern, Gesichter verpixeln, Metadaten entfernen), lädt das Bild per
-SFTP auf einen Webserver und stellt es zusätzlich per HTTP bereit.
+**Aus einer Tapo-Kamera eine öffentliche Webcam machen – auch mit Akku-Kameras ohne RTSP und auch,
+wenn die Kamera ganz woanders steht.**
 
-Funktioniert **auch mit Modellen ohne RTSP/ONVIF** – Akku-Kameras wie C410/C420/C425/C460,
-Türklingel D230, Kameras am Hub H200/H500 – und auch, wenn die Kamera an einem ganz anderen Ort
-steht (Zugriff über das TP-Link-Cloud-Relay, wie die Tapo-App unterwegs).
+Der Dienst holt in festen Abständen ein Standbild, macht Gesichter unkenntlich, verkleinert das Bild,
+entfernt alle Metadaten und lädt es per SFTP auf deinen Webserver. Nachts erscheint ein „Es ist
+Nacht“-Bild, bei Störungen oder schwachem Akku ein neutrales „Vorübergehend außer Betrieb“ – ohne
+dass Besucher den Grund erfahren.
 
-![Platzhalterbilder](docs/img/placeholders.jpg)
+* **Ohne RTSP/ONVIF:** Akku-Kameras wie C410/C420/C425/C460, Türklingel D230, Kameras am Hub H200/H500
+* **Ohne Gerät vor Ort:** Zugriff über das TP-Link-Cloud-Relay, wie die Tapo-App unterwegs – oder lokal im LAN
+* **Datenschutz eingebaut:** Gesichtserkennung mit Verpixeln, Fail-safe, kein Original wird gespeichert
+* **Akkuschonend:** Zeitfenster, Akkustand-Messung ohne zusätzliches Aufwecken, automatische Pausen
+* **Einfach zu betreiben:** ein Python-Dienst, systemd oder Docker, eine TOML-Datei
+
+![Platzhalterbilder für Nacht und Störung](docs/img/placeholders.jpg)
+
+## So läuft es ab
+
+```
+Tapo-Kamera ──(Cloud-Relay oder LAN)──► Standbild ──► Gesichter verpixeln ──► verkleinern,
+Metadaten weg ──► Archiv + latest.jpg ──► SFTP-Upload ──► deine Website
+                                       └─► HTTP-API für Dashboard / ioBroker
+```
+
+Alle 15 Minuten ein Bild (einstellbar), nur im gewünschten Zeitfenster, z. B. 09:00–19:00.
 
 ## Funktionen
 
@@ -41,6 +57,36 @@ sudo systemctl enable --now tapo-webcam
 
 Weboberfläche: `http://<server>:8099/`
 
+Minimale Konfiguration für eine Cloud-Kamera mit Upload:
+
+```toml
+output_dir         = "/var/lib/tapo-webcam/images"
+cloud_session_file = "/var/lib/tapo-webcam/cloud_session.json"
+
+[defaults]
+active_hours = "09:00-19:00"
+max_width    = 1280
+face_blur    = true
+battery_min  = 30
+placeholders = true
+
+[upload]
+host = "ssh.example.de"
+user = "webcam"
+key  = "/var/lib/tapo-webcam/.ssh/sftp_ed25519"
+dir  = "html/webcam"
+name = "webcam.jpg"
+
+[[camera]]
+name         = "parkplatz"
+connection   = "cloud"
+cloud_device = "Parkplatz"     # Name wie in der Tapo-App
+interval     = 900
+timeout      = 30
+```
+
+Alle Optionen: [Konfiguration](docs/konfiguration.md).
+
 ## Dokumentation
 
 | Kapitel | Inhalt |
@@ -68,6 +114,13 @@ Dockerfile, docker-compose.yml
 iobroker/              Skript für den ioBroker-JavaScript-Adapter
 docs/                  ausführliche Dokumentation
 ```
+
+## Getestet mit
+
+* Tapo **C460** (Akku, 4K) über die Cloud, Ubuntu 24.04 in einer VM (2 GB RAM), Upload zu einem
+  Webhoster per SFTP.
+* Andere Modelle sollten funktionieren, sofern die Tapo-App ein Livebild zeigt. Rückmeldungen sind
+  willkommen.
 
 ## Hinweise
 
